@@ -1,6 +1,6 @@
 module k8s.io/autoscaler/cluster-autoscaler
 
-go 1.22.12
+go 1.24
 
 require (
 	cloud.google.com/go/compute/metadata v0.3.0
@@ -30,6 +30,7 @@ require (
 	github.com/spf13/pflag v1.0.5
 	github.com/stretchr/testify v1.9.0
 	github.com/vburenin/ifacemaker v1.2.1
+	github.com/verda-cloud/verdacloud-sdk-go v1.2.1
 	go.uber.org/mock v0.4.0
 	golang.org/x/net v0.27.0
 	golang.org/x/oauth2 v0.21.0

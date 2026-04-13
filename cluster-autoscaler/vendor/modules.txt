@@ -744,6 +744,10 @@ github.com/syndtr/gocapability/capability
 ## explicit; go 1.18
 github.com/vburenin/ifacemaker
 github.com/vburenin/ifacemaker/maker
+# github.com/verda-cloud/verdacloud-sdk-go v1.2.1
+## explicit; go 1.24
+github.com/verda-cloud/verdacloud-sdk-go/pkg/verda
+github.com/verda-cloud/verdacloud-sdk-go/pkg/verda/testutil
 # github.com/vishvananda/netlink v1.1.0
 ## explicit; go 1.12
 github.com/vishvananda/netlink
