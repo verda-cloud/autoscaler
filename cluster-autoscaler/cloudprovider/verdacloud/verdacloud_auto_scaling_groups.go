@@ -27,6 +27,9 @@ import (
 	"time"
 
 	"github.com/verda-cloud/verdacloud-sdk-go/pkg/verda"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	kube_client "k8s.io/client-go/kubernetes"
 	klog "k8s.io/klog/v2"
 )
 
@@ -39,6 +42,9 @@ const (
 	FAILED_INSTANCE_CLEANUP_AGE       = 10 * time.Minute // delete stuck failed instances after this
 	FAILED_INSTANCE_MAP_ENTRY_TTL     = 1 * time.Hour    // prevent unbounded map growth
 	MAX_CONCURRENT_INSTANCE_CREATIONS = 10
+	// NODE_SWEEP_TIMEOUT bounds the K8s API calls used to reap orphan Nodes so
+	// a slow apiserver can't stall the refresh loop.
+	NODE_SWEEP_TIMEOUT = 10 * time.Second
 )
 
 // ASG_SEPARATOR is the separator pattern used to parse hostnames.
@@ -52,6 +58,9 @@ type autoScalingGroups struct {
 	asgNodeGroupSpecs map[AsgRef]string
 	cfg               *cloudConfig
 	dcService         dcService
+	// kubeClient reaps orphan K8s Node objects whose VerdaCloud VMs have
+	// disappeared from the API. Nil in unit tests — sweep is a no-op then.
+	kubeClient kube_client.Interface
 
 	failedInstances  map[string]time.Time // tracks failed instances (no_capacity, error, unknown) for backoff
 	lastFailureCheck map[AsgRef]time.Time
@@ -59,7 +68,7 @@ type autoScalingGroups struct {
 	cacheMutex sync.RWMutex
 }
 
-func newAutoScalingGroups(dcService dcService, nodeGroupSpecs []string, cfg *cloudConfig) (*autoScalingGroups, error) {
+func newAutoScalingGroups(dcService dcService, nodeGroupSpecs []string, cfg *cloudConfig, kubeClient kube_client.Interface) (*autoScalingGroups, error) {
 	registry := &autoScalingGroups{
 		registeredAsgs:    make(map[AsgRef]*Asg),
 		asgToInstances:    make(map[AsgRef][]InstanceRef),
@@ -70,6 +79,7 @@ func newAutoScalingGroups(dcService dcService, nodeGroupSpecs []string, cfg *clo
 		lastFailureCheck:  make(map[AsgRef]time.Time),
 		cfg:               cfg,
 		dcService:         dcService,
+		kubeClient:        kubeClient,
 	}
 
 	if err := registry.parseASGNodeGroupSpecs(nodeGroupSpecs); err != nil {
@@ -196,7 +206,87 @@ func (m *autoScalingGroups) regenerate() error {
 	// 5. Handle failed instances (backoff tracking, cleanup)
 	m.processFailedInstances(existingAsgs, allFailedInstances)
 
+	// 6. Reap K8s Node objects whose VerdaCloud VMs are gone.
+	//    Since there is no cloud-controller-manager for VerdaCloud, nothing else
+	//    deletes orphan Nodes — without this sweep they linger as NotReady forever.
+	apiHostnames := make(map[string]bool, len(allInstances))
+	for _, inst := range allInstances {
+		apiHostnames[inst.Hostname] = true
+	}
+	m.sweepOrphanNodes(ctx, apiHostnames)
+
 	return nil
+}
+
+// sweepOrphanNodes deletes K8s Node objects whose VerdaCloud VM has disappeared
+// from the API. Only touches Nodes whose hostname was created by one of our
+// registered ASGs, so manually-provisioned VerdaCloud VMs (e.g. control plane)
+// are left alone. Best-effort: errors are logged, never fail the refresh loop.
+func (m *autoScalingGroups) sweepOrphanNodes(ctx context.Context, apiHostnames map[string]bool) {
+	if m.kubeClient == nil {
+		return
+	}
+
+	listCtx, cancel := context.WithTimeout(ctx, NODE_SWEEP_TIMEOUT)
+	defer cancel()
+	nodes, err := m.kubeClient.CoreV1().Nodes().List(listCtx, metav1.ListOptions{})
+	if err != nil {
+		klog.Warningf("sweepOrphanNodes: failed to list Nodes: %v", err)
+		return
+	}
+
+	for i := range nodes.Items {
+		node := &nodes.Items[i]
+		pid := node.Spec.ProviderID
+		if !strings.HasPrefix(pid, verdacloudProviderIDPrefix) {
+			continue
+		}
+		ref, err := instanceRefFromProviderId(pid)
+		if err != nil {
+			klog.V(4).Infof("sweepOrphanNodes: cannot parse providerID %q on Node %s: %v", pid, node.Name, err)
+			continue
+		}
+		if !m.belongsToManagedAsg(ref.Hostname) {
+			continue
+		}
+		if apiHostnames[ref.Hostname] {
+			continue
+		}
+
+		deleteCtx, cancel := context.WithTimeout(ctx, NODE_SWEEP_TIMEOUT)
+		err = m.kubeClient.CoreV1().Nodes().Delete(deleteCtx, node.Name, metav1.DeleteOptions{})
+		cancel()
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			klog.Warningf("sweepOrphanNodes: failed to delete orphan Node %s (hostname %s): %v", node.Name, ref.Hostname, err)
+			continue
+		}
+		klog.Infof("sweepOrphanNodes: deleted orphan Node %s (hostname %s) — VerdaCloud VM no longer present", node.Name, ref.Hostname)
+	}
+}
+
+// belongsToManagedAsg returns true when the hostname matches the hostnamePrefix
+// (or Name fallback) of any registered ASG. Mirrors the matching rule used in
+// categorizeInstancesForAsg so the sweep scope is the same as the cache scope.
+func (m *autoScalingGroups) belongsToManagedAsg(hostname string) bool {
+	prefix, err := extractAsgNameFromHostname(hostname)
+	if err != nil {
+		return false
+	}
+	m.cacheMutex.RLock()
+	defer m.cacheMutex.RUnlock()
+	for _, asg := range m.registeredAsgs {
+		matchKey := asg.hostnamePrefix
+		if matchKey == "" {
+			matchKey = asg.Name
+		}
+		if strings.EqualFold(prefix, matchKey) {
+			return true
+		}
+	}
+	return false
 }
 
 // reconcileCurSize adjusts curSize for each ASG based on active and failed instance counts.

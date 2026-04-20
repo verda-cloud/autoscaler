@@ -32,6 +32,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	"github.com/verda-cloud/verdacloud-sdk-go/pkg/verda"
+	kube_client "k8s.io/client-go/kubernetes"
 )
 
 const (
@@ -46,6 +47,7 @@ type VerdacloudManager struct {
 	sdkProvider *verdacloudSDKProvider
 	dcService   dcService
 	asgs        *autoScalingGroups
+	kubeClient  kube_client.Interface
 	lastRefresh time.Time
 }
 
@@ -63,7 +65,7 @@ type InstanceResource struct {
 	GPU          int64
 }
 
-func createVerdacloudManager(cloudReader io.Reader, discoveryOpts cloudprovider.NodeGroupDiscoveryOptions) (*VerdacloudManager, error) {
+func createVerdacloudManager(cloudReader io.Reader, discoveryOpts cloudprovider.NodeGroupDiscoveryOptions, kubeClient kube_client.Interface) (*VerdacloudManager, error) {
 	cfg := &cloudConfig{}
 	if cloudReader != nil {
 		decoder := json.NewDecoder(cloudReader)
@@ -91,10 +93,11 @@ func createVerdacloudManager(cloudReader io.Reader, discoveryOpts cloudprovider.
 		cfg:         cfg,
 		sdkProvider: sdkProvider,
 		dcService:   dcService,
+		kubeClient:  kubeClient,
 		asgs:        nil,
 	}
 
-	manager.asgs, err = newAutoScalingGroups(dcService, discoveryOpts.NodeGroupSpecs, cfg)
+	manager.asgs, err = newAutoScalingGroups(dcService, discoveryOpts.NodeGroupSpecs, cfg, kubeClient)
 	if err != nil {
 		return nil, err
 	}
