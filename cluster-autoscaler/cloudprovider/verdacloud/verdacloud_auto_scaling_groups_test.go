@@ -781,7 +781,7 @@ func TestDeleteInstance_MinSizeCheck_CurSizeDrift(t *testing.T) {
 	// This test documents the scenario where curSize has drifted from actual instance count.
 	//
 	// Scenario: curSize=10 (inflated due to failed scale-ups), but only 3 actual instances.
-	// DeleteNodes checks curSize: 10-2=8 >= 8 (minSize) → PASSES (incorrectly!)
+	// DeleteNodes checks curSize: 10-2=8 >= 8 (minSize), so it passes incorrectly.
 	//
 	// The fix adds a secondary check in DeleteInstance using actual API count,
 	// which would block the deletion. However, that requires a live dcService
@@ -802,7 +802,7 @@ func TestDeleteInstance_MinSizeCheck_CurSizeDrift(t *testing.T) {
 
 	err := nodeGroup.DeleteNodes(nodes)
 
-	// DeleteNodes uses curSize (10), so 10-2=8 >= 8 (minSize) → check PASSES
+	// DeleteNodes uses curSize (10), so 10-2=8 >= 8 (minSize) passes.
 	// This demonstrates why we needed the secondary check in DeleteInstance.
 	if err != nil && strings.Contains(err.Error(), "would violate min size") {
 		// This should NOT happen with curSize=10
@@ -1392,7 +1392,7 @@ func makeAPIInstances(asg *Asg, statuses []string) []verda.Instance {
 }
 
 func TestCurSizeStability_ScaleUpAllRunning(t *testing.T) {
-	// Scenario 1: Scale-up 3 → all become running → regenerate
+	// Scenario 1: Scale up 3; all become running; regenerate.
 	// Expected: curSize stays 3
 	_, asg, asgs := newTestEnv(t)
 
@@ -1413,7 +1413,7 @@ func TestCurSizeStability_ScaleUpAllRunning(t *testing.T) {
 }
 
 func TestCurSizeStability_ScaleUpOneNoCapacity(t *testing.T) {
-	// Scenario 2: Scale-up 3 → 1 goes no_capacity → regenerate
+	// Scenario 2: Scale up 3; 1 goes no_capacity; regenerate.
 	// Expected: curSize drops to 2
 	_, asg, asgs := newTestEnv(t)
 
@@ -1439,7 +1439,7 @@ func TestCurSizeStability_ScaleUpOneNoCapacity(t *testing.T) {
 }
 
 func TestCurSizeStability_ScaleUpNotInAPIYet(t *testing.T) {
-	// Scenario 3: Scale-up 3 → none in API yet → regenerate
+	// Scenario 3: Scale up 3; none are in the API yet; regenerate.
 	// Expected: curSize stays 3 (preserved from cache)
 	_, asg, asgs := newTestEnv(t)
 
@@ -1463,7 +1463,7 @@ func TestCurSizeStability_ScaleUpNotInAPIYet(t *testing.T) {
 }
 
 func TestCurSizeStability_ScaleUpPartiallyInAPI(t *testing.T) {
-	// Scenario 4: Scale-up 3 → 2 in API as provisioning, 1 not yet → regenerate
+	// Scenario 4: Scale up 3; 2 are in the API as provisioning, 1 is not yet; regenerate.
 	// Expected: curSize stays 3 (2 from API + 1 preserved)
 	_, asg, asgs := newTestEnv(t)
 
@@ -1488,7 +1488,7 @@ func TestCurSizeStability_ScaleUpPartiallyInAPI(t *testing.T) {
 }
 
 func TestCurSizeStability_DeleteThenRegenerate(t *testing.T) {
-	// Scenario 5: Have 3 running → delete 1 → regenerate sees 2
+	// Scenario 5: Have 3 running; delete 1; regenerate sees 2.
 	// Expected: curSize stays 2
 	_, asg, asgs := newTestEnv(t)
 
@@ -1520,8 +1520,8 @@ func TestCurSizeStability_DeleteThenRegenerate(t *testing.T) {
 }
 
 func TestCurSizeStability_ExternalDeletion(t *testing.T) {
-	// Scenario 6: Have 3 running → 1 externally deleted (not by us) → regenerate sees 2
-	// Expected: curSize stays 3 (conservative — no failures detected)
+	// Scenario 6: Have 3 running; 1 is externally deleted (not by us); regenerate sees 2.
+	// Expected: curSize stays 3 (conservative, no failures detected).
 	// This is intentional: curSize only decreases when failed instances are detected.
 	// CA will notice the node is gone and call DecreaseTargetSize if needed.
 	_, asg, asgs := newTestEnv(t)
@@ -1544,7 +1544,7 @@ func TestCurSizeStability_ExternalDeletion(t *testing.T) {
 }
 
 func TestCurSizeStability_InstanceGoesOffline(t *testing.T) {
-	// Scenario 7: Have 3 running → 1 goes offline → regenerate
+	// Scenario 7: Have 3 running; 1 goes offline; regenerate.
 	// Expected: curSize stays 3 (offline is ignored, not failed)
 	_, asg, asgs := newTestEnv(t)
 
@@ -1552,7 +1552,7 @@ func TestCurSizeStability_InstanceGoesOffline(t *testing.T) {
 	refs := createTestInstanceRefs(t, 3)
 	asgs.updateCacheWithInstances(asg, toCreateResults(refs))
 
-	// API: 2 running, 1 offline (offline is neither active nor failed — just ignored)
+	// API: 2 running, 1 offline. Offline is neither active nor failed.
 	apiInstances := makeAPIInstances(asg, []string{
 		verda.StatusRunning, verda.StatusRunning, verda.StatusOffline,
 	})
@@ -1565,7 +1565,7 @@ func TestCurSizeStability_InstanceGoesOffline(t *testing.T) {
 }
 
 func TestCurSizeStability_AllInstancesFail(t *testing.T) {
-	// Scenario 8: Scale-up 3 → all go error → regenerate
+	// Scenario 8: Scale up 3; all go error; regenerate.
 	// Expected: curSize drops to 0
 	_, asg, asgs := newTestEnv(t)
 
@@ -1847,7 +1847,7 @@ func TestRegenerate_FullFlow(t *testing.T) {
 		assertNoError(t, err)
 
 		// 1 running (active), 1 no_capacity (failed), 1 deleting (ignored)
-		// reconcileCurSize: active(1) < curSize(3) and failedCount(1) > 0 → curSize = 1
+		// reconcileCurSize: active(1) < curSize(3) and failedCount(1) > 0, so curSize = 1.
 		if asg.curSize != 1 {
 			t.Errorf("expected curSize=1, got %d", asg.curSize)
 		}
@@ -2215,7 +2215,7 @@ func TestFullLifecycle_ScaleUpRegenerateScaleDown(t *testing.T) {
 	}
 	t.Logf("Phase 1 complete: curSize=%d", asg.curSize)
 
-	// Phase 2: Instances appear in API as running → regenerate
+	// Phase 2: Instances appear in API as running; regenerate.
 	mock.setInstances(makeAPIInstances(asg, []string{
 		verda.StatusRunning, verda.StatusRunning, verda.StatusRunning,
 	}))
@@ -2492,7 +2492,7 @@ func TestSweepOrphanNodes(t *testing.T) {
 	// Hostnames created by our registered ASG
 	aliveHost := fmt.Sprintf("%s-vm-%s-alive01", testHostnamePrefix, strings.ToLower(testLocation))
 	orphanHost := fmt.Sprintf("%s-vm-%s-orphan02", testHostnamePrefix, strings.ToLower(testLocation))
-	// A hostname whose prefix does NOT match any ASG — e.g. a control-plane VM
+	// A hostname whose prefix does not match any ASG, e.g. a control-plane VM.
 	foreignHost := fmt.Sprintf("controlplane-vm-%s-cp0001", strings.ToLower(testLocation))
 
 	aliveNode := makeNode("alive-node", providerIDFor(aliveHost))
@@ -2559,7 +2559,7 @@ func TestSweepOrphanNodes_ToleratesNotFound(t *testing.T) {
 	asgs.kubeClient = kubeClient
 	asgs.cfg = &cloudConfig{ReapOrphanNodes: true, ReapOrphanNodesAfterCycles: 1}
 
-	// No panic, no error path escapes — best-effort contract.
+	// No panic, no error path escapes; this is a best-effort contract.
 	asgs.sweepOrphanNodes(context.Background(), map[string]bool{})
 }
 
@@ -2653,7 +2653,7 @@ func TestSweepOrphanNodes_CycleGating(t *testing.T) {
 		t.Fatalf("expected flaky counter cleared after reappearing, got %d", asgs.missingNodeCycles[flakyHost])
 	}
 
-	// Cycle 3: orphanHost still missing — counter hits threshold, deletion happens.
+	// Cycle 3: orphanHost still missing; counter hits threshold, deletion happens.
 	// flakyHost is still alive, no change.
 	asgs.sweepOrphanNodes(context.Background(), map[string]bool{flakyHost: true})
 	names := listNames()

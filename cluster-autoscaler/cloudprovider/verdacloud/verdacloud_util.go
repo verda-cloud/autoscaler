@@ -25,7 +25,17 @@ import (
 	"strings"
 )
 
-var shellAssignmentRe = regexp.MustCompile(`^\s*(export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)(\s+#.*)?$`)
+var (
+	shellAssignmentRe = regexp.MustCompile(`^\s*(export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)(\s+#.*)?$`)
+	// heredocStartRe matches a heredoc opener (e.g. `cat <<EOF`, `<<-EOF`,
+	// `<<'EOF'`). Anchoring at end-of-line avoids the simplest false positive
+	// (lines that mention `<<EOF` mid-string). Limitations: does not handle
+	// `<<"EOF"` (double-quoted form) or trailing `# comment`; treat the
+	// matcher as best-effort for cloud-init scripts.
+	heredocStartRe = regexp.MustCompile(`<<-?'?([A-Za-z0-9_]+)'?\s*$`)
+	// asgSpecNameRe enforces a DNS-label-ish format for ASG names and hostname prefixes.
+	asgSpecNameRe = regexp.MustCompile(`^[a-z0-9A-Z]+[a-z0-9A-Z\-\.\_]*[a-z0-9A-Z]+$|^[a-z0-9A-Z]{1}$`)
+)
 
 type shellQuoteStyle int
 
@@ -37,7 +47,7 @@ const (
 
 // injectEnvVarsIntoScript rewrites shell variable assignments with values from envMap.
 // Skips heredoc blocks to avoid corrupting embedded documents.
-func injectEnvVarsIntoScript(script []byte, envMap map[string]string) []byte {
+func injectEnvVarsIntoScript(script []byte, envMap map[string]string) ([]byte, error) {
 	var out bytes.Buffer
 	sc := bufio.NewScanner(bytes.NewReader(script))
 	sc.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
@@ -68,13 +78,15 @@ func injectEnvVarsIntoScript(script []byte, envMap map[string]string) []byte {
 		out.WriteString(line)
 		out.WriteByte('\n')
 	}
-	return out.Bytes()
+	if err := sc.Err(); err != nil {
+		return nil, fmt.Errorf("scanning startup script: %w", err)
+	}
+	return out.Bytes(), nil
 }
 
 // parseHeredocDelimiter detects heredoc syntax (<<EOF or <<'EOF') and returns the delimiter.
 func parseHeredocDelimiter(line string) (string, bool) {
-	hd := regexp.MustCompile(`<<-?'?([A-Za-z0-9_]+)'?`)
-	m := hd.FindStringSubmatch(line)
+	m := heredocStartRe.FindStringSubmatch(line)
 	if len(m) == 2 {
 		return m[1], true
 	}
@@ -192,17 +204,13 @@ func convertConfigLabelsToK8sLabels(labels []string, asg *Asg) string {
 	if asg == nil {
 		return ""
 	}
-	if len(labels) == 0 {
-		labels = make([]string, 0, 2)
-	}
-
-	labels = append(labels, fmt.Sprintf("%s=%s", NodeGroupLabelKey, asg.Name))
-
+	result := make([]string, 0, len(labels)+2)
+	result = append(result, labels...)
+	result = append(result, fmt.Sprintf("%s=%s", NodeGroupLabelKey, asg.Name))
 	if isGPUInstanceType(asg.instanceType) {
-		labels = append(labels, fmt.Sprintf("%s=%s", AcceleratorLabel, asg.instanceType))
+		result = append(result, fmt.Sprintf("%s=%s", AcceleratorLabel, asg.instanceType))
 	}
-
-	return strings.Join(labels, ",")
+	return strings.Join(result, ",")
 }
 
 func parseAsgSpec(spec string) (*VerdacloudAsgSpec, error) {
@@ -220,16 +228,15 @@ func parseAsgSpec(spec string) (*VerdacloudAsgSpec, error) {
 		return nil, fmt.Errorf("invalid max size: %s", parts[1])
 	}
 
-	validName := regexp.MustCompile(`^[a-z0-9A-Z]+[a-z0-9A-Z\-\.\_]*[a-z0-9A-Z]+$|^[a-z0-9A-Z]{1}$`)
 	asgName := parts[3]
-	if !validName.MatchString(asgName) {
+	if !asgSpecNameRe.MatchString(asgName) {
 		return nil, fmt.Errorf("invalid ASG name: %s", asgName)
 	}
 
 	hostnamePrefix := ""
 	if len(parts) == 5 && parts[4] != "" {
 		hostnamePrefix = parts[4]
-		if !validName.MatchString(hostnamePrefix) {
+		if !asgSpecNameRe.MatchString(hostnamePrefix) {
 			return nil, fmt.Errorf("invalid hostname prefix: %s", hostnamePrefix)
 		}
 	}

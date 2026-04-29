@@ -19,10 +19,16 @@ package verdacloud
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"strings"
 
 	apiv1 "k8s.io/api/core/v1"
 	klog "k8s.io/klog/v2"
+)
+
+const (
+	minOSVolumeSizeGB   = 50
+	BillingContractSpot = "SPOT"
 )
 
 type cloudConfig struct {
@@ -127,18 +133,13 @@ func (cfg *cloudConfig) isValid() bool {
 func (cfg *cloudConfig) GetNodeConfig(asgName string) *nodeConfig {
 	billingCfg := cfg.BillingConfig
 
-	startupScriptEnv := make(map[string]string)
-	for k, v := range cfg.StartupScriptEnv {
-		startupScriptEnv[k] = v
-	}
+	startupScriptEnv := make(map[string]string, len(cfg.StartupScriptEnv))
+	maps.Copy(startupScriptEnv, cfg.StartupScriptEnv)
 
 	labels := mergeLabels(cfg.Labels, nil)
 	taints := mergeTaints(cfg.Taints, nil)
 
-	osVolumeSize := 50 // min 50GB
-	if cfg.OSVolumeSize >= 50 {
-		osVolumeSize = cfg.OSVolumeSize
-	}
+	osVolumeSize := max(cfg.OSVolumeSize, minOSVolumeSizeGB)
 
 	availableLocations := cfg.AvailableLocations
 	var volumes []additionalVolume
@@ -153,7 +154,7 @@ func (cfg *cloudConfig) GetNodeConfig(asgName string) *nodeConfig {
 		if len(groupCfg.Taints) > 0 {
 			taints = mergeTaints(cfg.Taints, groupCfg.Taints)
 		}
-		if groupCfg.OSVolumeSize != nil && *groupCfg.OSVolumeSize >= 50 {
+		if groupCfg.OSVolumeSize != nil && *groupCfg.OSVolumeSize >= minOSVolumeSizeGB {
 			osVolumeSize = *groupCfg.OSVolumeSize
 		}
 		if len(groupCfg.AvailableLocations) > 0 {
@@ -166,7 +167,7 @@ func (cfg *cloudConfig) GetNodeConfig(asgName string) *nodeConfig {
 	}
 
 	nc := &nodeConfig{
-		IsSpot:             billingCfg.Contract == "SPOT",
+		IsSpot:             billingCfg.Contract == BillingContractSpot,
 		Image:              "", // set by caller based on GPU/CPU
 		StartupScript:      cfg.StartupScript,
 		StartupScriptEnv:   startupScriptEnv,
@@ -187,18 +188,18 @@ func (cfg *cloudConfig) GetNodeConfig(asgName string) *nodeConfig {
 // mergeLabels merges labels; group wins on key conflict.
 func mergeLabels(global, group []string) []string {
 	labelMap := make(map[string]string)
-	for _, label := range global {
-		parts := strings.SplitN(label, "=", 2)
-		if len(parts) == 2 {
+	addAll := func(labels []string, source string) {
+		for _, label := range labels {
+			parts := strings.SplitN(label, "=", 2)
+			if len(parts) != 2 {
+				klog.Warningf("dropping malformed %s label %q: expected key=value", source, label)
+				continue
+			}
 			labelMap[parts[0]] = parts[1]
 		}
 	}
-	for _, label := range group {
-		parts := strings.SplitN(label, "=", 2)
-		if len(parts) == 2 {
-			labelMap[parts[0]] = parts[1]
-		}
-	}
+	addAll(global, "global")
+	addAll(group, "group")
 	result := make([]string, 0, len(labelMap))
 	for k, v := range labelMap {
 		result = append(result, k+"="+v)

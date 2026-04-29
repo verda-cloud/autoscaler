@@ -40,7 +40,7 @@ type mockDCService struct {
 	instances    []verda.Instance
 	instancesErr error
 
-	// Callback hooks — when non-nil, override the default behaviour.
+	// Callback hooks. When non-nil, these override the default behaviour.
 	createFunc func(ctx context.Context, req *verda.CreateInstanceRequest) (*verda.Instance, error)
 	actionFunc func(ctx context.Context, instanceID, action string) error
 	deleteFunc func(ctx context.Context, instanceID string) error

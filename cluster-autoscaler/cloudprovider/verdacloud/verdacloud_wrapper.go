@@ -19,7 +19,6 @@ package verdacloud
 import (
 	"context"
 	"fmt"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -29,10 +28,8 @@ import (
 )
 
 const (
-	// instanceCacheTTL is how long cached instance data remains valid.
-	// Set to 1 minute to avoid excessive API calls across CA scan cycles
-	// (default scan interval is 10s, so cache survives ~6 cycles).
-	// Mutations (create/delete) call InvalidateCache() to force fresh data.
+	// instanceCacheTTL bounds instance cache freshness across autoscaler scan cycles.
+	// Mutating operations invalidate the cache so subsequent reads observe fresh data.
 	instanceCacheTTL = 1 * time.Minute
 )
 
@@ -90,13 +87,33 @@ type dcService interface {
 type verdacloudWrapper struct {
 	client *verda.Client
 	cache  *instanceCache
+
+	// typeCache stores last-known-good API responses for instance type
+	// details, keyed by uppercased instance-type name. Served only when
+	// a fresh API call fails. This protects against transient
+	// /instance-types outages without ever fabricating data.
+	typeCacheMu sync.RWMutex
+	typeCache   map[string]*InstanceResource
 }
 
 func newVerdacloudWrapper(client *verda.Client) *verdacloudWrapper {
 	return &verdacloudWrapper{
-		client: client,
-		cache:  &instanceCache{},
+		client:    client,
+		cache:     &instanceCache{},
+		typeCache: make(map[string]*InstanceResource),
 	}
+}
+
+func (w *verdacloudWrapper) lookupTypeCache(instanceType string) *InstanceResource {
+	w.typeCacheMu.RLock()
+	defer w.typeCacheMu.RUnlock()
+	return w.typeCache[strings.ToUpper(instanceType)]
+}
+
+func (w *verdacloudWrapper) cacheType(instanceType string, res *InstanceResource) {
+	w.typeCacheMu.Lock()
+	defer w.typeCacheMu.Unlock()
+	w.typeCache[strings.ToUpper(instanceType)] = res
 }
 
 func isActiveStatus(status string) bool {
@@ -129,6 +146,10 @@ func (w *verdacloudWrapper) GetInstanceAvailabilityLocation(ctx context.Context,
 	return "", nil
 }
 
+// GetInstanceTypeDetails returns CPU/memory/GPU for the given instance type.
+// Always uses exact API data and never heuristics. On API failure, falls back
+// to the last-known-good API response from typeCache; returns an error only
+// if we have never successfully observed the type.
 func (w *verdacloudWrapper) GetInstanceTypeDetails(ctx context.Context, instanceType string) (*InstanceResource, error) {
 	if instanceType == "" {
 		return nil, fmt.Errorf("instance type is empty")
@@ -136,74 +157,35 @@ func (w *verdacloudWrapper) GetInstanceTypeDetails(ctx context.Context, instance
 
 	allInstanceTypes, err := w.client.InstanceTypes.Get(ctx, "")
 	if err != nil {
-		klog.Warningf("Error fetching instance types, falling back to parsing: %v", err)
-		return parseInstanceType(instanceType), nil
+		if cached := w.lookupTypeCache(instanceType); cached != nil {
+			klog.Warningf("InstanceTypes API failed (%v); serving last-known-good cached details for %s", err, instanceType)
+			return cached, nil
+		}
+		return nil, fmt.Errorf("fetch instance types: %w", err)
 	}
 
+	// API succeeded: refresh cache for every type the API returned, and
+	// pick out the one the caller asked for.
+	var found *InstanceResource
 	for i := range allInstanceTypes {
 		spec := &allInstanceTypes[i]
+		res := &InstanceResource{
+			InstanceType: spec.InstanceType,
+			Arch:         "amd64",
+			CPU:          int64(spec.CPU.NumberOfCores),
+			Memory:       int64(spec.Memory.SizeInGigabytes) * 1024 * 1024 * 1024,
+			GPU:          int64(spec.GPU.NumberOfGPUs),
+		}
+		w.cacheType(spec.InstanceType, res)
 		if strings.EqualFold(spec.InstanceType, instanceType) {
-			return &InstanceResource{
-				InstanceType: spec.InstanceType,
-				Arch:         "amd64",
-				CPU:          int64(spec.CPU.NumberOfCores),
-				Memory:       int64(spec.Memory.SizeInGigabytes) * 1024 * 1024 * 1024,
-				GPU:          int64(spec.GPU.NumberOfGPUs),
-			}, nil
+			found = res
 		}
 	}
 
-	klog.Warningf("Instance type %s not found in API, falling back to parsing", instanceType)
-	return parseInstanceType(instanceType), nil
-}
-
-// parseInstanceType fallback when API lookup fails.
-// Supports formats:
-//   - CPU: "CPU.4V.16G" (vCPU.memory)
-//   - GPU 2-part: "1H100.22V" (gpuCount+model.vCPU)
-//   - GPU 3-part: "1H100.80S.22V" (gpuCount+model.vram.vCPU)
-func parseInstanceType(instanceType string) *InstanceResource {
-	cpu, memory, gpu := int64(4), int64(32), int64(0)
-	parts := strings.Split(instanceType, ".")
-
-	if len(parts) >= 2 {
-		if strings.HasPrefix(instanceType, "CPU.") {
-			if vCpu, err := strconv.ParseInt(strings.TrimSuffix(parts[1], "V"), 10, 64); err == nil {
-				cpu = vCpu
-			}
-			if len(parts) >= 3 {
-				if mem, err := strconv.ParseInt(strings.TrimSuffix(parts[2], "G"), 10, 64); err == nil {
-					memory = mem
-				}
-			}
-		} else {
-			// GPU: extract count from first part (e.g., "1H100" -> 1, "8H100" -> 8)
-			for i, ch := range parts[0] {
-				if ch < '0' || ch > '9' {
-					if gpuCount, err := strconv.ParseInt(parts[0][:i], 10, 64); err == nil {
-						gpu = gpuCount
-					}
-					break
-				}
-			}
-			// vCPU is in the last part ending with "V"
-			lastPart := parts[len(parts)-1]
-			if strings.HasSuffix(lastPart, "V") {
-				if vCpu, err := strconv.ParseInt(strings.TrimSuffix(lastPart, "V"), 10, 64); err == nil {
-					cpu = vCpu
-				}
-			}
-			memory = cpu * 4 // rough GPU estimate
-		}
+	if found != nil {
+		return found, nil
 	}
-
-	return &InstanceResource{
-		InstanceType: instanceType,
-		Arch:         "amd64",
-		CPU:          cpu,
-		Memory:       memory * 1024 * 1024 * 1024,
-		GPU:          gpu,
-	}
+	return nil, fmt.Errorf("instance type %s not found in VerdaCloud API", instanceType)
 }
 
 // ListInstancesCached returns cached instances or fetches fresh data if cache expired.
@@ -234,7 +216,7 @@ func (w *verdacloudWrapper) GetInstanceByHostname(ctx context.Context, hostname 
 		return nil, err
 	}
 	for _, inst := range instances {
-		if inst.Hostname == hostname && isActiveStatus(inst.Status) {
+		if strings.EqualFold(inst.Hostname, hostname) && isActiveStatus(inst.Status) {
 			return &inst, nil
 		}
 	}
@@ -313,7 +295,11 @@ func (w *verdacloudWrapper) CreateStartScript(ctx context.Context, name, script 
 }
 
 func (w *verdacloudWrapper) DeleteStartScript(ctx context.Context, id string) error {
-	return w.client.StartupScripts.DeleteStartupScript(ctx, id)
+	if err := w.client.StartupScripts.DeleteStartupScript(ctx, id); err != nil {
+		klog.Warningf("delete startup script %s failed (script may leak on VerdaCloud side): %v", id, err)
+		return err
+	}
+	return nil
 }
 
 func (w *verdacloudWrapper) ListInstanceTypes(ctx context.Context) ([]string, error) {
