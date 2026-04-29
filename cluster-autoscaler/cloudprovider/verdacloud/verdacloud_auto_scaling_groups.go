@@ -109,7 +109,6 @@ func (m *autoScalingGroups) GetAsgByRef(ref AsgRef) (*Asg, error) {
 	return asg, nil
 }
 
-
 func (m *autoScalingGroups) FindASGForInstance(ref *InstanceRef) (*Asg, error) {
 	m.cacheMutex.RLock()
 	defer m.cacheMutex.RUnlock()

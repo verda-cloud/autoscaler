@@ -282,7 +282,10 @@ func (w *verdacloudWrapper) CreateInstance(ctx context.Context, req *verda.Creat
 }
 
 func (w *verdacloudWrapper) PerformInstanceAction(ctx context.Context, instanceID, action string) error {
-	err := w.client.Instances.Action(ctx, []string{instanceID}, action, nil)
+	_, err := w.client.Instances.Action(ctx, verda.InstanceActionRequest{
+		Action: action,
+		ID:     []string{instanceID},
+	})
 	if err == nil {
 		// Invalidate cache after action that may change instance state
 		w.InvalidateCache()
@@ -291,7 +294,7 @@ func (w *verdacloudWrapper) PerformInstanceAction(ctx context.Context, instanceI
 }
 
 func (w *verdacloudWrapper) DeleteInstance(ctx context.Context, instanceID string) error {
-	if err := w.client.Instances.Delete(ctx, nil, instanceID); err != nil {
+	if err := w.client.Instances.Delete(ctx, []string{instanceID}, nil, false); err != nil {
 		return fmt.Errorf("delete instance %s failed: %w", instanceID, err)
 	}
 	// Invalidate cache after deletion

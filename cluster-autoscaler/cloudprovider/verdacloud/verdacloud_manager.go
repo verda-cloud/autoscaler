@@ -27,11 +27,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/verda-cloud/verdacloud-sdk-go/pkg/verda"
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
-	"github.com/verda-cloud/verdacloud-sdk-go/pkg/verda"
 	kube_client "k8s.io/client-go/kubernetes"
 )
 
@@ -296,8 +296,8 @@ func (m *VerdacloudManager) buildNodeFromTemplate(asg *Asg, template *asgTemplat
 		// Multi-location value is intentional: ASG instances are provisioned by trying
 		// locations in order until one succeeds, providing availability fallback.
 		"topology.kubernetes.io/location": strings.Join(asg.AvailabilityLocations, ","),
-		"verda.com/hostname":               asg.Name,
-		NodeGroupLabelKey:                  asg.Name,
+		"verda.com/hostname":              asg.Name,
+		NodeGroupLabelKey:                 asg.Name,
 	}
 	if template.InstanceType.GPU > 0 {
 		labels[AcceleratorLabel] = template.InstanceType.InstanceType
