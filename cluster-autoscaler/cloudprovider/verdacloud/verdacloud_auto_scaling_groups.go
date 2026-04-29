@@ -65,6 +65,13 @@ type autoScalingGroups struct {
 	failedInstances  map[string]time.Time // tracks failed instances (no_capacity, error, unknown) for backoff
 	lastFailureCheck map[AsgRef]time.Time
 
+	// missingNodeCycles counts consecutive Refresh cycles where a hostname
+	// has been absent from the VerdaCloud API. Used by sweepOrphanNodes to
+	// gate deletion behind cfg.ReapOrphanNodesAfterCycles, so a single bad
+	// API response cannot delete a healthy Node. Reset to zero when the
+	// hostname reappears. Protected by cacheMutex.
+	missingNodeCycles map[string]int
+
 	cacheMutex sync.RWMutex
 }
 
@@ -77,6 +84,7 @@ func newAutoScalingGroups(dcService dcService, nodeGroupSpecs []string, cfg *clo
 		asgNodeGroupSpecs: make(map[AsgRef]string),
 		failedInstances:   make(map[string]time.Time),
 		lastFailureCheck:  make(map[AsgRef]time.Time),
+		missingNodeCycles: make(map[string]int),
 		cfg:               cfg,
 		dcService:         dcService,
 		kubeClient:        kubeClient,
@@ -206,13 +214,15 @@ func (m *autoScalingGroups) regenerate() error {
 	m.processFailedInstances(existingAsgs, allFailedInstances)
 
 	// 6. Reap K8s Node objects whose VerdaCloud VMs are gone.
-	//    Since there is no cloud-controller-manager for VerdaCloud, nothing else
-	//    deletes orphan Nodes — without this sweep they linger as NotReady forever.
-	apiHostnames := make(map[string]bool, len(allInstances))
-	for _, inst := range allInstances {
-		apiHostnames[inst.Hostname] = true
+	//    Opt-in transitional feature for clusters without a cloud-controller-manager.
+	//    When a CCM is deployed it owns Node lifecycle and this sweep stays disabled.
+	if m.cfg != nil && m.cfg.ReapOrphanNodes {
+		apiHostnames := make(map[string]bool, len(allInstances))
+		for _, inst := range allInstances {
+			apiHostnames[inst.Hostname] = true
+		}
+		m.sweepOrphanNodes(ctx, apiHostnames)
 	}
-	m.sweepOrphanNodes(ctx, apiHostnames)
 
 	return nil
 }
@@ -221,9 +231,19 @@ func (m *autoScalingGroups) regenerate() error {
 // from the API. Only touches Nodes whose hostname was created by one of our
 // registered ASGs, so manually-provisioned VerdaCloud VMs (e.g. control plane)
 // are left alone. Best-effort: errors are logged, never fail the refresh loop.
+//
+// To avoid deleting healthy Nodes on a single bad API response, a hostname must
+// be missing from apiHostnames for cfg.ReapOrphanNodesAfterCycles consecutive
+// Refresh cycles before its Node is deleted. The counter resets when the
+// hostname reappears.
 func (m *autoScalingGroups) sweepOrphanNodes(ctx context.Context, apiHostnames map[string]bool) {
 	if m.kubeClient == nil {
 		return
+	}
+
+	threshold := 3
+	if m.cfg != nil && m.cfg.ReapOrphanNodesAfterCycles >= 1 {
+		threshold = m.cfg.ReapOrphanNodesAfterCycles
 	}
 
 	listCtx, cancel := context.WithTimeout(ctx, NODE_SWEEP_TIMEOUT)
@@ -233,6 +253,11 @@ func (m *autoScalingGroups) sweepOrphanNodes(ctx context.Context, apiHostnames m
 		klog.Warningf("sweepOrphanNodes: failed to list Nodes: %v", err)
 		return
 	}
+
+	// Track which managed hostnames we observed on this pass; clear stale
+	// counter entries afterwards so a Node that was reaped (or whose VM came
+	// back) doesn't keep state in the map forever.
+	seenManaged := make(map[string]bool)
 
 	for i := range nodes.Items {
 		node := &nodes.Items[i]
@@ -248,7 +273,26 @@ func (m *autoScalingGroups) sweepOrphanNodes(ctx context.Context, apiHostnames m
 		if !m.belongsToManagedAsg(ref.Hostname) {
 			continue
 		}
+		seenManaged[ref.Hostname] = true
+
 		if apiHostnames[ref.Hostname] {
+			// VM is back (or was never gone): clear the missing-cycle counter.
+			m.cacheMutex.Lock()
+			delete(m.missingNodeCycles, ref.Hostname)
+			m.cacheMutex.Unlock()
+			continue
+		}
+
+		// Hostname missing from API. Increment counter; only delete after
+		// the threshold of consecutive missing cycles is reached.
+		m.cacheMutex.Lock()
+		m.missingNodeCycles[ref.Hostname]++
+		cycles := m.missingNodeCycles[ref.Hostname]
+		m.cacheMutex.Unlock()
+
+		if cycles < threshold {
+			klog.V(4).Infof("sweepOrphanNodes: hostname %s missing for %d/%d cycles, deferring deletion of Node %s",
+				ref.Hostname, cycles, threshold, node.Name)
 			continue
 		}
 
@@ -257,13 +301,30 @@ func (m *autoScalingGroups) sweepOrphanNodes(ctx context.Context, apiHostnames m
 		cancel()
 		if err != nil {
 			if apierrors.IsNotFound(err) {
+				m.cacheMutex.Lock()
+				delete(m.missingNodeCycles, ref.Hostname)
+				m.cacheMutex.Unlock()
 				continue
 			}
 			klog.Warningf("sweepOrphanNodes: failed to delete orphan Node %s (hostname %s): %v", node.Name, ref.Hostname, err)
 			continue
 		}
-		klog.Infof("sweepOrphanNodes: deleted orphan Node %s (hostname %s) — VerdaCloud VM no longer present", node.Name, ref.Hostname)
+		m.cacheMutex.Lock()
+		delete(m.missingNodeCycles, ref.Hostname)
+		m.cacheMutex.Unlock()
+		klog.Infof("sweepOrphanNodes: deleted orphan Node %s (hostname %s) after %d missing cycles — VerdaCloud VM no longer present",
+			node.Name, ref.Hostname, cycles)
 	}
+
+	// Drop counter entries for hostnames whose Nodes have already been
+	// removed (e.g. by another actor), so the map doesn't accumulate forever.
+	m.cacheMutex.Lock()
+	for hostname := range m.missingNodeCycles {
+		if !seenManaged[hostname] {
+			delete(m.missingNodeCycles, hostname)
+		}
+	}
+	m.cacheMutex.Unlock()
 }
 
 // belongsToManagedAsg returns true when the hostname matches the hostnamePrefix
@@ -855,6 +916,10 @@ func (m *autoScalingGroups) DeleteInstance(ref InstanceRef) error {
 		}
 	}
 	instanceID := m.instanceIDs[ref]
+	curSizeAtRead := 0
+	if asg != nil {
+		curSizeAtRead = asg.curSize
+	}
 	m.cacheMutex.RUnlock()
 
 	if !found {
@@ -868,7 +933,7 @@ func (m *autoScalingGroups) DeleteInstance(ref InstanceRef) error {
 	}
 
 	klog.V(4).Infof("DeleteInstance: deleting %s (id=%s, curSize: %d)",
-		ref.Hostname, instanceID, asg.curSize)
+		ref.Hostname, instanceID, curSizeAtRead)
 
 	if err := m.dcService.PerformInstanceAction(ctx, instanceID, verda.ActionDelete); err != nil {
 		return fmt.Errorf("delete instance %s failed: %w", ref.Hostname, err)

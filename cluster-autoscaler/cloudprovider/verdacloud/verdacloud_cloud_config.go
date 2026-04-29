@@ -37,6 +37,19 @@ type cloudConfig struct {
 	Taints             []apiv1.Taint          `json:"taints"`
 	Groups             map[string]GroupConfig `json:"groups"`
 	OSVolumeSize       int                    `json:"osVolumeSize"`
+
+	// ReapOrphanNodes opts into deleting K8s Node objects whose VerdaCloud VMs
+	// have disappeared from the API. This is a transitional feature for
+	// clusters that don't yet run a verdacloud cloud-controller-manager.
+	// Default: false. When a CCM is deployed it owns Node lifecycle and this
+	// flag should remain off.
+	ReapOrphanNodes bool `json:"reapOrphanNodes"`
+
+	// ReapOrphanNodesAfterCycles is the number of consecutive Refresh cycles
+	// a hostname must be absent from the VerdaCloud API before its K8s Node
+	// is deleted. Guards against deleting Nodes on a single bad API response.
+	// Only consulted when ReapOrphanNodes is true. Default (when 0): 3.
+	ReapOrphanNodesAfterCycles int `json:"reapOrphanNodesAfterCycles"`
 }
 
 // GroupConfig overrides global config per-ASG.
