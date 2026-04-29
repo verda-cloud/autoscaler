@@ -1074,96 +1074,48 @@ func TestTrackAndCleanupFailedInstance_RecentEntryKept(t *testing.T) {
 // VerdacloudNodeGroup Interface Tests
 // =============================================================================
 
-func TestNodeGroup_MaxSize(t *testing.T) {
-	manager, asg, _ := newTestEnv(t)
-	asg.maxSize = 100
-
-	ng := newTestNodeGroup(t, manager, asg)
-
-	if ng.MaxSize() != 100 {
-		t.Errorf("expected MaxSize=100, got %d", ng.MaxSize())
-	}
-}
-
-func TestNodeGroup_MinSize(t *testing.T) {
-	manager, asg, _ := newTestEnv(t)
-	asg.minSize = 5
-
-	ng := newTestNodeGroup(t, manager, asg)
-
-	if ng.MinSize() != 5 {
-		t.Errorf("expected MinSize=5, got %d", ng.MinSize())
-	}
-}
-
-func TestNodeGroup_Id(t *testing.T) {
-	manager, asg, _ := newTestEnv(t)
-
-	ng := newTestNodeGroup(t, manager, asg)
-
-	if ng.Id() != testAsgName {
-		t.Errorf("expected Id=%s, got %s", testAsgName, ng.Id())
-	}
-}
-
-func TestNodeGroup_Debug(t *testing.T) {
+// TestNodeGroup_PassthroughMethods covers the cloudprovider.NodeGroup methods
+// that are simple passthroughs to the underlying Asg or fixed returns. Each
+// behavior is one assertion; bundling them avoids repetitive setup.
+func TestNodeGroup_PassthroughMethods(t *testing.T) {
 	manager, asg, _ := newTestEnv(t)
 	asg.minSize = 1
 	asg.maxSize = 10
-
-	ng := newTestNodeGroup(t, manager, asg)
-	debug := ng.Debug()
-
-	if !strings.Contains(debug, testAsgName) {
-		t.Errorf("Debug() should contain ASG name, got: %s", debug)
-	}
-	if !strings.Contains(debug, "1:10") {
-		t.Errorf("Debug() should contain min:max (1:10), got: %s", debug)
-	}
-}
-
-func TestNodeGroup_GetOptions(t *testing.T) {
-	manager, asg, _ := newTestEnv(t)
 	ng := newTestNodeGroup(t, manager, asg)
 
-	defaults := config.NodeGroupAutoscalingOptions{
-		ScaleDownUtilizationThreshold: 0.5,
+	if got := ng.MaxSize(); got != 10 {
+		t.Errorf("MaxSize=%d, want 10", got)
+	}
+	if got := ng.MinSize(); got != 1 {
+		t.Errorf("MinSize=%d, want 1", got)
+	}
+	if got := ng.Id(); got != testAsgName {
+		t.Errorf("Id=%s, want %s", got, testAsgName)
+	}
+	if debug := ng.Debug(); !strings.Contains(debug, testAsgName) || !strings.Contains(debug, "1:10") {
+		t.Errorf("Debug=%q, want substrings %q and %q", debug, testAsgName, "1:10")
+	}
+	if ng.Autoprovisioned() {
+		t.Error("Autoprovisioned()=true, want false")
+	}
+	if err := ng.AtomicIncreaseSize(1); err == nil {
+		t.Error("AtomicIncreaseSize(1) returned nil, want ErrNotImplemented")
+	}
+	if err := ng.ForceDeleteNodes(nil); err == nil {
+		t.Error("ForceDeleteNodes(nil) returned nil, want ErrNotImplemented")
 	}
 
+	defaults := config.NodeGroupAutoscalingOptions{ScaleDownUtilizationThreshold: 0.5}
 	opts, err := ng.GetOptions(defaults)
 	assertNoError(t, err)
-
 	if opts.ScaleDownUtilizationThreshold != 0.5 {
-		t.Errorf("expected ScaleDownUtilizationThreshold=0.5, got %f", opts.ScaleDownUtilizationThreshold)
+		t.Errorf("GetOptions.ScaleDownUtilizationThreshold=%f, want 0.5", opts.ScaleDownUtilizationThreshold)
 	}
-}
 
-func TestNodeGroup_Autoprovisioned(t *testing.T) {
-	manager, asg, _ := newTestEnv(t)
-	ng := newTestNodeGroup(t, manager, asg)
-
-	if ng.Autoprovisioned() {
-		t.Error("Autoprovisioned() should return false")
-	}
-}
-
-func TestNodeGroup_AtomicIncreaseSize(t *testing.T) {
-	manager, asg, _ := newTestEnv(t)
-	ng := newTestNodeGroup(t, manager, asg)
-
-	err := ng.AtomicIncreaseSize(1)
-	if err == nil {
-		t.Error("AtomicIncreaseSize should return ErrNotImplemented")
-	}
-}
-
-func TestNodeGroup_ForceDeleteNodes(t *testing.T) {
-	manager, asg, _ := newTestEnv(t)
-	ng := newTestNodeGroup(t, manager, asg)
-
-	err := ng.ForceDeleteNodes(nil)
-	if err == nil {
-		t.Error("ForceDeleteNodes should return ErrNotImplemented")
+	created, err := ng.Create()
+	assertNoError(t, err)
+	if created != ng {
+		t.Error("Create() should return the same node group")
 	}
 }
 
@@ -1278,18 +1230,6 @@ func TestNodeGroup_Exist(t *testing.T) {
 			t.Error("Exist() should return false for unregistered ASG")
 		}
 	})
-}
-
-func TestNodeGroup_Create(t *testing.T) {
-	manager, asg, _ := newTestEnv(t)
-	ng := newTestNodeGroup(t, manager, asg)
-
-	created, err := ng.Create()
-	assertNoError(t, err)
-
-	if created != ng {
-		t.Error("Create() should return the same node group")
-	}
 }
 
 func TestFindASGForInstance(t *testing.T) {

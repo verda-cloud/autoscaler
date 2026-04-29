@@ -23,6 +23,20 @@ import (
 	apiv1 "k8s.io/api/core/v1"
 )
 
+// minimalValidConfig returns a cloudConfig with only the fields required by
+// validate(): images, an SSH key, billing, a startup script and at least one
+// availability location. Tests focused on a single behavior populate that
+// behavior and let the rest stay at sensible defaults.
+func minimalValidConfig() *cloudConfig {
+	return &cloudConfig{
+		Image:              imageConfig{GPU: "gpu-image", CPU: "cpu-image"},
+		SSHKeyIDs:          []string{"key-1"},
+		BillingConfig:      billingConfig{Price: "DYNAMIC", Contract: "PAY_AS_YOU_GO"},
+		StartupScript:      "base64script",
+		AvailableLocations: []string{"FIN-01"},
+	}
+}
+
 func TestCloudConfig_Validate(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -574,289 +588,138 @@ func TestMergeTaints(t *testing.T) {
 	}
 }
 
-func TestCloudConfig_GetNodeConfig_OSVolumeSize_Default(t *testing.T) {
-	cfg := &cloudConfig{
-		Image:              imageConfig{GPU: "gpu-image", CPU: "cpu-image"},
-		SSHKeyIDs:          []string{"key-1"},
-		BillingConfig:      billingConfig{Price: "DYNAMIC", Contract: "PAY_AS_YOU_GO"},
-		StartupScript:      "base64script",
-		AvailableLocations: []string{"FIN-01"},
-	}
-
-	nodeCfg := cfg.GetNodeConfig("any-asg")
-
-	if nodeCfg.OSVolumeSize != 50 {
-		t.Errorf("Expected default OSVolumeSize=50, got %d", nodeCfg.OSVolumeSize)
-	}
-}
-
-func TestCloudConfig_GetNodeConfig_OSVolumeSize_GlobalOverride(t *testing.T) {
-	cfg := &cloudConfig{
-		Image:              imageConfig{GPU: "gpu-image", CPU: "cpu-image"},
-		SSHKeyIDs:          []string{"key-1"},
-		BillingConfig:      billingConfig{Price: "DYNAMIC", Contract: "PAY_AS_YOU_GO"},
-		StartupScript:      "base64script",
-		AvailableLocations: []string{"FIN-01"},
-		OSVolumeSize:       100,
-	}
-
-	nodeCfg := cfg.GetNodeConfig("any-asg")
-
-	if nodeCfg.OSVolumeSize != 100 {
-		t.Errorf("Expected global OSVolumeSize=100, got %d", nodeCfg.OSVolumeSize)
-	}
-}
-
-func TestCloudConfig_GetNodeConfig_OSVolumeSize_BelowMinimum(t *testing.T) {
-	cfg := &cloudConfig{
-		Image:              imageConfig{GPU: "gpu-image", CPU: "cpu-image"},
-		SSHKeyIDs:          []string{"key-1"},
-		BillingConfig:      billingConfig{Price: "DYNAMIC", Contract: "PAY_AS_YOU_GO"},
-		StartupScript:      "base64script",
-		AvailableLocations: []string{"FIN-01"},
-		OSVolumeSize:       30,
-	}
-
-	nodeCfg := cfg.GetNodeConfig("any-asg")
-
-	if nodeCfg.OSVolumeSize != 50 {
-		t.Errorf("Expected OSVolumeSize=50 (below minimum should use default), got %d", nodeCfg.OSVolumeSize)
-	}
-}
-
-func TestCloudConfig_GetNodeConfig_OSVolumeSize_GroupOverride(t *testing.T) {
-	osVolSize := 200
-	cfg := &cloudConfig{
-		Image:              imageConfig{GPU: "gpu-image", CPU: "cpu-image"},
-		SSHKeyIDs:          []string{"key-1"},
-		BillingConfig:      billingConfig{Price: "DYNAMIC", Contract: "PAY_AS_YOU_GO"},
-		StartupScript:      "base64script",
-		AvailableLocations: []string{"FIN-01"},
-		OSVolumeSize:       100,
-		Groups: map[string]GroupConfig{
-			"gpu-workers": {
-				OSVolumeSize: &osVolSize,
-			},
-		},
-	}
-
-	nodeCfg := cfg.GetNodeConfig("gpu-workers")
-
-	if nodeCfg.OSVolumeSize != 200 {
-		t.Errorf("Expected group OSVolumeSize=200, got %d", nodeCfg.OSVolumeSize)
-	}
-}
-
-func TestCloudConfig_GetNodeConfig_OSVolumeSize_GroupBelowMinimum(t *testing.T) {
-	osVolSize := 30
-	cfg := &cloudConfig{
-		Image:              imageConfig{GPU: "gpu-image", CPU: "cpu-image"},
-		SSHKeyIDs:          []string{"key-1"},
-		BillingConfig:      billingConfig{Price: "DYNAMIC", Contract: "PAY_AS_YOU_GO"},
-		StartupScript:      "base64script",
-		AvailableLocations: []string{"FIN-01"},
-		OSVolumeSize:       100,
-		Groups: map[string]GroupConfig{
-			"test-workers": {
-				OSVolumeSize: &osVolSize,
-			},
-		},
-	}
-
-	nodeCfg := cfg.GetNodeConfig("test-workers")
-
-	if nodeCfg.OSVolumeSize != 100 {
-		t.Errorf("Expected global OSVolumeSize=100 (group below minimum), got %d", nodeCfg.OSVolumeSize)
-	}
-}
-
-func TestCloudConfig_GetNodeConfig_OSVolumeSize_Precedence(t *testing.T) {
+func TestCloudConfig_GetNodeConfig_OSVolumeSize(t *testing.T) {
 	tests := []struct {
-		name            string
-		globalSize      int
-		groupSize       *int
-		expectedSize    int
-		expectedAsgName string
+		name       string
+		globalSize int
+		groupSize  *int
+		want       int
 	}{
-		{
-			name:            "default only (no global, no group)",
-			globalSize:      0,
-			groupSize:       nil,
-			expectedSize:    50,
-			expectedAsgName: "test-asg",
-		},
-		{
-			name:            "global overrides default",
-			globalSize:      80,
-			groupSize:       nil,
-			expectedSize:    80,
-			expectedAsgName: "test-asg",
-		},
-		{
-			name:            "group overrides global",
-			globalSize:      80,
-			groupSize:       intPtr(150),
-			expectedSize:    150,
-			expectedAsgName: "test-asg",
-		},
-		{
-			name:            "group overrides default (no global)",
-			globalSize:      0,
-			groupSize:       intPtr(120),
-			expectedSize:    120,
-			expectedAsgName: "test-asg",
-		},
+		{name: "default when unset", globalSize: 0, groupSize: nil, want: 50},
+		{name: "global override", globalSize: 100, groupSize: nil, want: 100},
+		{name: "global below minimum falls back to default", globalSize: 30, groupSize: nil, want: 50},
+		{name: "group override beats global", globalSize: 100, groupSize: intPtr(200), want: 200},
+		{name: "group below minimum falls back to global", globalSize: 100, groupSize: intPtr(30), want: 100},
+		{name: "group overrides default when no global", globalSize: 0, groupSize: intPtr(120), want: 120},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cfg := &cloudConfig{
-				Image:              imageConfig{GPU: "gpu-image", CPU: "cpu-image"},
-				SSHKeyIDs:          []string{"key-1"},
-				BillingConfig:      billingConfig{Price: "DYNAMIC", Contract: "PAY_AS_YOU_GO"},
-				StartupScript:      "base64script",
-				AvailableLocations: []string{"FIN-01"},
-				OSVolumeSize:       tt.globalSize,
-			}
-
+			cfg := minimalValidConfig()
+			cfg.OSVolumeSize = tt.globalSize
 			if tt.groupSize != nil {
-				cfg.Groups = map[string]GroupConfig{
-					tt.expectedAsgName: {
-						OSVolumeSize: tt.groupSize,
-					},
-				}
+				cfg.Groups = map[string]GroupConfig{testAsgName: {OSVolumeSize: tt.groupSize}}
 			}
-
-			nodeCfg := cfg.GetNodeConfig(tt.expectedAsgName)
-
-			if nodeCfg.OSVolumeSize != tt.expectedSize {
-				t.Errorf("Expected OSVolumeSize=%d, got %d", tt.expectedSize, nodeCfg.OSVolumeSize)
+			if got := cfg.GetNodeConfig(testAsgName).OSVolumeSize; got != tt.want {
+				t.Errorf("OSVolumeSize=%d, want %d", got, tt.want)
 			}
 		})
 	}
 }
 
-func TestCloudConfig_GetNodeConfig_AvailableLocations_Default(t *testing.T) {
-	cfg := &cloudConfig{
-		Image:              imageConfig{GPU: "gpu-image", CPU: "cpu-image"},
-		SSHKeyIDs:          []string{"key-1"},
-		BillingConfig:      billingConfig{Price: "DYNAMIC", Contract: "PAY_AS_YOU_GO"},
-		StartupScript:      "base64script",
-		AvailableLocations: []string{"FIN-02", "FIN-03"},
-	}
-
-	nodeCfg := cfg.GetNodeConfig("any-asg")
-
-	if len(nodeCfg.AvailableLocations) != 2 {
-		t.Fatalf("Expected 2 locations, got %d", len(nodeCfg.AvailableLocations))
-	}
-	if !containsString(nodeCfg.AvailableLocations, "FIN-02") {
-		t.Errorf("Expected FIN-02 in locations, got %v", nodeCfg.AvailableLocations)
-	}
-	if !containsString(nodeCfg.AvailableLocations, "FIN-03") {
-		t.Errorf("Expected FIN-03 in locations, got %v", nodeCfg.AvailableLocations)
-	}
-}
-
-func TestCloudConfig_GetNodeConfig_AvailableLocations_GroupReplaces(t *testing.T) {
-	cfg := &cloudConfig{
-		Image:              imageConfig{GPU: "gpu-image", CPU: "cpu-image"},
-		SSHKeyIDs:          []string{"key-1"},
-		BillingConfig:      billingConfig{Price: "DYNAMIC", Contract: "PAY_AS_YOU_GO"},
-		StartupScript:      "base64script",
-		AvailableLocations: []string{"FIN-02", "FIN-03"},
-		Groups: map[string]GroupConfig{
-			"gpu-workers": {
-				AvailableLocations: []string{"FIN-03"},
-			},
+func TestCloudConfig_GetNodeConfig_AvailableLocations(t *testing.T) {
+	tests := []struct {
+		name       string
+		globalLocs []string
+		groupLocs  []string // for "gpu-workers"; nil means no group override
+		queryAsg   string
+		want       []string
+	}{
+		{
+			name:       "default uses global",
+			globalLocs: []string{"FIN-02", "FIN-03"},
+			queryAsg:   "any-asg",
+			want:       []string{"FIN-02", "FIN-03"},
+		},
+		{
+			name:       "group replaces global",
+			globalLocs: []string{"FIN-02", "FIN-03"},
+			groupLocs:  []string{"FIN-03"},
+			queryAsg:   "gpu-workers",
+			want:       []string{"FIN-03"},
+		},
+		{
+			name:       "unknown asg falls back to global",
+			globalLocs: []string{"FIN-02", "FIN-03"},
+			groupLocs:  []string{"FIN-03"},
+			queryAsg:   "cpu-workers",
+			want:       []string{"FIN-02", "FIN-03"},
 		},
 	}
 
-	nodeCfg := cfg.GetNodeConfig("gpu-workers")
-
-	if len(nodeCfg.AvailableLocations) != 1 {
-		t.Fatalf("Expected 1 location (group replaces global), got %d: %v", len(nodeCfg.AvailableLocations), nodeCfg.AvailableLocations)
-	}
-	if nodeCfg.AvailableLocations[0] != "FIN-03" {
-		t.Errorf("Expected FIN-03, got %s", nodeCfg.AvailableLocations[0])
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := minimalValidConfig()
+			cfg.AvailableLocations = tt.globalLocs
+			if tt.groupLocs != nil {
+				cfg.Groups = map[string]GroupConfig{"gpu-workers": {AvailableLocations: tt.groupLocs}}
+			}
+			got := cfg.GetNodeConfig(tt.queryAsg).AvailableLocations
+			sort.Strings(got)
+			want := append([]string(nil), tt.want...)
+			sort.Strings(want)
+			if !reflectDeepEqualStrings(got, want) {
+				t.Errorf("AvailableLocations=%v, want %v", got, want)
+			}
+		})
 	}
 }
 
-func TestCloudConfig_GetNodeConfig_AvailableLocations_UnknownAsgUsesGlobal(t *testing.T) {
-	cfg := &cloudConfig{
-		Image:              imageConfig{GPU: "gpu-image", CPU: "cpu-image"},
-		SSHKeyIDs:          []string{"key-1"},
-		BillingConfig:      billingConfig{Price: "DYNAMIC", Contract: "PAY_AS_YOU_GO"},
-		StartupScript:      "base64script",
-		AvailableLocations: []string{"FIN-02", "FIN-03"},
-		Groups: map[string]GroupConfig{
-			"gpu-workers": {
-				AvailableLocations: []string{"FIN-03"},
-			},
+func TestCloudConfig_GetNodeConfig_AdditionalVolumes(t *testing.T) {
+	tests := []struct {
+		name      string
+		groupVols []additionalVolume
+		queryAsg  string
+		want      []additionalVolume
+	}{
+		{
+			name:     "no global, no group: empty",
+			queryAsg: "any-asg",
+			want:     nil,
+		},
+		{
+			name:      "group volumes returned for matching asg",
+			groupVols: []additionalVolume{{Name: "data", Size: 500, Type: "SSD"}, {Name: "scratch", Size: 200, Type: "SSD"}},
+			queryAsg:  "gpu-workers",
+			want:      []additionalVolume{{Name: "data", Size: 500, Type: "SSD"}, {Name: "scratch", Size: 200, Type: "SSD"}},
+		},
+		{
+			name:      "non-matching asg gets no volumes",
+			groupVols: []additionalVolume{{Name: "data", Size: 500, Type: "SSD"}},
+			queryAsg:  "cpu-workers",
+			want:      nil,
 		},
 	}
 
-	nodeCfg := cfg.GetNodeConfig("cpu-workers")
-
-	if len(nodeCfg.AvailableLocations) != 2 {
-		t.Fatalf("Expected 2 locations (global), got %d", len(nodeCfg.AvailableLocations))
-	}
-	if !containsString(nodeCfg.AvailableLocations, "FIN-02") {
-		t.Errorf("Expected FIN-02 in locations, got %v", nodeCfg.AvailableLocations)
-	}
-	if !containsString(nodeCfg.AvailableLocations, "FIN-03") {
-		t.Errorf("Expected FIN-03 in locations, got %v", nodeCfg.AvailableLocations)
-	}
-}
-
-func TestCloudConfig_GetNodeConfig_AdditionalVolumes_GroupOnly(t *testing.T) {
-	cfg := &cloudConfig{
-		Image:              imageConfig{GPU: "gpu-image", CPU: "cpu-image"},
-		SSHKeyIDs:          []string{"key-1"},
-		BillingConfig:      billingConfig{Price: "DYNAMIC", Contract: "PAY_AS_YOU_GO"},
-		StartupScript:      "base64script",
-		AvailableLocations: []string{"FIN-01"},
-		Groups: map[string]GroupConfig{
-			"gpu-workers": {
-				AdditionalVolumes: []additionalVolume{
-					{Name: "data", Size: 500, Type: "SSD"},
-					{Name: "scratch", Size: 200, Type: "SSD"},
-				},
-			},
-		},
-	}
-
-	nodeCfg := cfg.GetNodeConfig("gpu-workers")
-	if len(nodeCfg.Volumes) != 2 {
-		t.Fatalf("Expected 2 volumes for gpu-workers, got %d", len(nodeCfg.Volumes))
-	}
-	if nodeCfg.Volumes[0].Name != "data" || nodeCfg.Volumes[0].Size != 500 {
-		t.Errorf("Expected data volume (500GB), got %+v", nodeCfg.Volumes[0])
-	}
-	if nodeCfg.Volumes[1].Name != "scratch" || nodeCfg.Volumes[1].Size != 200 {
-		t.Errorf("Expected scratch volume (200GB), got %+v", nodeCfg.Volumes[1])
-	}
-
-	nodeCfg2 := cfg.GetNodeConfig("cpu-workers")
-	if len(nodeCfg2.Volumes) != 0 {
-		t.Errorf("Expected 0 volumes for cpu-workers, got %d", len(nodeCfg2.Volumes))
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := minimalValidConfig()
+			if tt.groupVols != nil {
+				cfg.Groups = map[string]GroupConfig{"gpu-workers": {AdditionalVolumes: tt.groupVols}}
+			}
+			got := cfg.GetNodeConfig(tt.queryAsg).Volumes
+			if len(got) != len(tt.want) {
+				t.Fatalf("Volumes len=%d, want %d (%+v)", len(got), len(tt.want), got)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("Volumes[%d]=%+v, want %+v", i, got[i], tt.want[i])
+				}
+			}
+		})
 	}
 }
 
-func TestCloudConfig_GetNodeConfig_AdditionalVolumes_NoGlobal(t *testing.T) {
-	cfg := &cloudConfig{
-		Image:              imageConfig{GPU: "gpu-image", CPU: "cpu-image"},
-		SSHKeyIDs:          []string{"key-1"},
-		BillingConfig:      billingConfig{Price: "DYNAMIC", Contract: "PAY_AS_YOU_GO"},
-		StartupScript:      "base64script",
-		AvailableLocations: []string{"FIN-01"},
+func reflectDeepEqualStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
 	}
-
-	nodeCfg := cfg.GetNodeConfig("any-asg")
-
-	if len(nodeCfg.Volumes) != 0 {
-		t.Errorf("Expected 0 volumes (no global, no group), got %d", len(nodeCfg.Volumes))
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
 	}
+	return true
 }
 
 func TestCloudConfig_GetNodeConfig_FullIntegration(t *testing.T) {
@@ -935,26 +798,9 @@ func containsLabel(labels []string, target string) bool {
 	return false
 }
 
-// assertContainsLabel fails the test if the target label is not found
-func assertContainsLabel(t *testing.T, labels []string, target string) {
-	t.Helper()
-	if !containsLabel(labels, target) {
-		t.Errorf("expected label %q in %v", target, labels)
-	}
-}
-
 func containsTaint(taints []apiv1.Taint, key string) bool {
 	for _, taint := range taints {
 		if taint.Key == key {
-			return true
-		}
-	}
-	return false
-}
-
-func containsString(slice []string, target string) bool {
-	for _, item := range slice {
-		if item == target {
 			return true
 		}
 	}
