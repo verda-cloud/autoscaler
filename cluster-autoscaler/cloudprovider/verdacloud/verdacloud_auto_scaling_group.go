@@ -40,13 +40,8 @@ type Asg struct {
 	AvailabilityLocations []string
 
 	scaleMutex sync.Mutex
-	// targetSizeMutex serializes per-ASG operations that read curSize against
-	// minSize and then take action: DeleteNodes (delete VMs) and
-	// DecreaseTargetSize (just lower curSize). Without this both operations
-	// can independently observe the same pre-action curSize, each pass the
-	// min-size check, and combine to push the final state below minSize.
-	// Held for the duration of the operation, including the API call in
-	// DeleteNodes — so concurrent decreases on the same ASG are sequential.
+	// targetSizeMutex serializes DeleteNodes and DecreaseTargetSize per-ASG
+	// to keep concurrent target-size decreases from breaching minSize.
 	targetSizeMutex sync.Mutex
 }
 
@@ -117,13 +112,9 @@ func (ng *VerdacloudNodeGroup) Belongs(node *apiv1.Node) (bool, error) {
 	return targetAsg.Name == ng.asg.Name, nil
 }
 
-// DeleteNodes deletes the specified nodes from the node group.
-// Part of cloudprovider.NodeGroup interface — called from CA's background
-// deletion goroutines. Acquires the per-ASG targetSizeMutex so that this
-// call cannot race with concurrent DeleteNodes or DecreaseTargetSize on
-// the same ASG: both operations read curSize against minSize and then
-// take action that lowers it, and they must be sequenced. Concurrent
-// deletes across different ASGs still parallelize.
+// DeleteNodes deletes the given nodes from the node group, holding
+// targetSizeMutex so concurrent target-size operations on the same ASG
+// cannot together overshoot minSize.
 func (ng *VerdacloudNodeGroup) DeleteNodes(nodes []*apiv1.Node) error {
 	ng.asg.targetSizeMutex.Lock()
 	defer ng.asg.targetSizeMutex.Unlock()
@@ -161,15 +152,10 @@ func (ng *VerdacloudNodeGroup) ForceDeleteNodes(nodes []*apiv1.Node) error {
 	return cloudprovider.ErrNotImplemented
 }
 
-// DecreaseTargetSize decreases the target size of the node group.
-// This only reduces the in-memory target counter (curSize) to correct for
-// unfulfilled capacity (e.g. instances that failed to register as nodes).
-// It must NOT delete any existing nodes — actual deletions happen in DeleteNodes.
-//
-// Acquires targetSizeMutex (shared with DeleteNodes) so a concurrent
-// DeleteNodes cannot have a delete in flight whose later cache decrement
-// would combine with our decrease and push curSize below minSize. Inside
-// that mutex, the curSize read+update is atomic under cacheMutex.Lock.
+// DecreaseTargetSize lowers curSize to reflect unfulfilled capacity (e.g.
+// instances that never registered). It does not delete VMs — that's
+// DeleteNodes's job. Both share targetSizeMutex to keep concurrent decreases
+// from pushing curSize below minSize.
 func (ng *VerdacloudNodeGroup) DecreaseTargetSize(delta int) error {
 	if delta >= 0 {
 		return fmt.Errorf("size decrease must be negative")

@@ -65,11 +65,9 @@ type autoScalingGroups struct {
 	failedInstances  map[string]time.Time // tracks failed instances (no_capacity, error, unknown) for backoff
 	lastFailureCheck map[AsgRef]time.Time
 
-	// missingNodeCycles counts consecutive Refresh cycles where a hostname
-	// has been absent from the VerdaCloud API. Used by sweepOrphanNodes to
-	// gate deletion behind cfg.ReapOrphanNodesAfterCycles, so a single bad
-	// API response cannot delete a healthy Node. Reset to zero when the
-	// hostname reappears. Protected by cacheMutex.
+	// missingNodeCycles counts consecutive Refresh cycles a hostname has been
+	// absent from the API; gates Node deletion behind ReapOrphanNodesAfterCycles.
+	// Protected by cacheMutex.
 	missingNodeCycles map[string]int
 
 	cacheMutex sync.RWMutex
@@ -227,15 +225,10 @@ func (m *autoScalingGroups) regenerate() error {
 	return nil
 }
 
-// sweepOrphanNodes deletes K8s Node objects whose VerdaCloud VM has disappeared
-// from the API. Only touches Nodes whose hostname was created by one of our
-// registered ASGs, so manually-provisioned VerdaCloud VMs (e.g. control plane)
-// are left alone. Best-effort: errors are logged, never fail the refresh loop.
-//
-// To avoid deleting healthy Nodes on a single bad API response, a hostname must
-// be missing from apiHostnames for cfg.ReapOrphanNodesAfterCycles consecutive
-// Refresh cycles before its Node is deleted. The counter resets when the
-// hostname reappears.
+// sweepOrphanNodes deletes K8s Nodes whose VerdaCloud VM is gone, after the
+// hostname has been missing from the API for ReapOrphanNodesAfterCycles
+// consecutive Refresh cycles. Scoped to managed-ASG hostnames so manually
+// provisioned VMs (e.g. control plane) are untouched. Best-effort.
 func (m *autoScalingGroups) sweepOrphanNodes(ctx context.Context, apiHostnames map[string]bool) {
 	if m.kubeClient == nil {
 		return
@@ -254,9 +247,7 @@ func (m *autoScalingGroups) sweepOrphanNodes(ctx context.Context, apiHostnames m
 		return
 	}
 
-	// Track which managed hostnames we observed on this pass; clear stale
-	// counter entries afterwards so a Node that was reaped (or whose VM came
-	// back) doesn't keep state in the map forever.
+	// Hostnames seen on this pass; used below to GC stale counter entries.
 	seenManaged := make(map[string]bool)
 
 	for i := range nodes.Items {
@@ -283,8 +274,7 @@ func (m *autoScalingGroups) sweepOrphanNodes(ctx context.Context, apiHostnames m
 			continue
 		}
 
-		// Hostname missing from API. Increment counter; only delete after
-		// the threshold of consecutive missing cycles is reached.
+		// Missing this cycle: bump counter, defer delete until threshold.
 		m.cacheMutex.Lock()
 		m.missingNodeCycles[ref.Hostname]++
 		cycles := m.missingNodeCycles[ref.Hostname]
