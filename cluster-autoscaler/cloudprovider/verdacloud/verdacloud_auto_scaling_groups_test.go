@@ -2457,6 +2457,84 @@ func TestDecreaseTargetSize_ConcurrentMinSizeInvariant(t *testing.T) {
 	}
 }
 
+// TestDeleteNodes_DecreaseTargetSize_CrossOpInvariant is a regression test for
+// the race where a concurrent DeleteNodes and DecreaseTargetSize on the same
+// ASG can each independently pass the min-size check based on the same
+// pre-action curSize, then combine to push the final state below minSize.
+//
+// Setup: minSize=2, curSize=4, 4 cached instances.
+//   - Goroutine A:  DeleteNodes(2 nodes)
+//   - Goroutine B:  DecreaseTargetSize(-2)
+//
+// Without the shared per-ASG targetSizeMutex, both observe curSize=4, both
+// pass their min-size check, A's API delete completes and decrements curSize
+// to 2, B's already-applied -2 leaves curSize=0, below minSize=2. With the
+// fix, the two operations serialize: whichever runs second sees the post-
+// first-op curSize and fails its min-size check.
+func TestDeleteNodes_DecreaseTargetSize_CrossOpInvariant(t *testing.T) {
+	mock, asg, asgs := newTestEnvWithMock(t)
+	asg.minSize = 2
+
+	// Slow the mocked delete so DecreaseTargetSize has time to enter its
+	// critical section concurrently with DeleteNodes' API call.
+	mock.actionFunc = func(_ context.Context, _, _ string) error {
+		time.Sleep(20 * time.Millisecond)
+		return nil
+	}
+
+	mock.setInstances(makeAPIInstances(asg, []string{
+		verda.StatusRunning, verda.StatusRunning, verda.StatusRunning, verda.StatusRunning,
+	}))
+	if err := asgs.regenerate(); err != nil {
+		t.Fatalf("regenerate failed: %v", err)
+	}
+	if asg.curSize != 4 {
+		t.Fatalf("setup: expected curSize=4, got %d", asg.curSize)
+	}
+
+	refs, _ := asgs.InstanceRefsForAsg(asg.AsgRef)
+	manager := &VerdacloudManager{asgs: asgs}
+	ng := newTestNodeGroup(t, manager, asg)
+
+	nodes := make([]*apiv1.Node, 4)
+	for i, r := range refs {
+		nodes[i] = makeNode(r.Hostname, r.ProviderID)
+	}
+
+	var wg sync.WaitGroup
+	var deleteErr, decreaseErr error
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		deleteErr = ng.DeleteNodes(nodes[0:2])
+	}()
+	go func() {
+		defer wg.Done()
+		decreaseErr = ng.DecreaseTargetSize(-2)
+	}()
+	wg.Wait()
+
+	if asg.curSize < asg.minSize {
+		t.Fatalf("curSize=%d violates minSize=%d (cross-op race detected)", asg.curSize, asg.minSize)
+	}
+
+	successes, failures := 0, 0
+	for _, err := range []error{deleteErr, decreaseErr} {
+		if err == nil {
+			successes++
+			continue
+		}
+		failures++
+		if !strings.Contains(err.Error(), "min size") {
+			t.Errorf("unexpected error: %v (want min-size violation)", err)
+		}
+	}
+	if successes != 1 || failures != 1 {
+		t.Errorf("expected exactly 1 success and 1 min-size error across DeleteNodes+DecreaseTargetSize, got success=%d error=%d (deleteErr=%v decreaseErr=%v)",
+			successes, failures, deleteErr, decreaseErr)
+	}
+}
+
 // makeNode builds a Node fixture with a providerID for sweep tests.
 func makeNode(name, providerID string) *apiv1.Node {
 	return &apiv1.Node{

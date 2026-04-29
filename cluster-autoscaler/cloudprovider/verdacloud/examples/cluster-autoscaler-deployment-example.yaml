@@ -139,12 +139,13 @@ metadata:
   name: verdacloud-credentials
   namespace: cluster-autoscaler
 type: Opaque
-data:
-  # Replace these with your actual base64-encoded credentials
-  # echo -n 'your-client-id' | base64
-  client-id: <your-client-id>
-  # echo -n 'your-client-secret' | base64
-  client-secret: <your-client-secret>
+# stringData accepts plaintext; the API server base64-encodes at apply time.
+# Replace placeholders with real credentials before applying. For production,
+# manage these via a secret manager (sealed-secrets, External Secrets, etc.)
+# rather than committing values here.
+stringData:
+  client-id: "your-client-id"
+  client-secret: "your-client-secret"
 
 ---
 # ConfigMap containing cluster configuration
