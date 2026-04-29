@@ -143,7 +143,7 @@ data:
   # Replace these with your actual base64-encoded credentials
   # echo -n 'your-client-id' | base64
   client-id: <your-client-id>
-  # echo -n 'your-client-secret' | base64  
+  # echo -n 'your-client-secret' | base64
   client-secret: <your-client-secret>
 
 ---
@@ -170,6 +170,9 @@ data:
       "debug": false,
       "availableLocations": ["FIN-02", "FIN-03"],
       "osVolumeSize": 100,
+      "_comment_reapOrphanNodes": "Optional. Default false. Enable only on clusters without a verdacloud cloud-controller-manager. When true, the autoscaler deletes K8s Nodes whose VMs have disappeared from the API after reapOrphanNodesAfterCycles consecutive Refresh cycles missing (default 3). Once a CCM is deployed, set this back to false.",
+      "reapOrphanNodes": false,
+      "reapOrphanNodesAfterCycles": 3,
       "labels": ["env=production"],
       "startupScript": "IyEvdXNyL2Jpbi9lbnYgYmFzaApzZXQgLWV1byBwaXBlZmFpbAoKIyMjID09PT09PSBDT05GSUdVUkUgVEhFU0UgPT09PT09ICMjIwpNQVNURVJfSVA9IiIKTUFTVEVSX1BPUlQ9IiIKCiMgRnJvbSBga3ViZWFkbSB0b2tlbiBjcmVhdGUgLS1wcmludC1qb2luLWNvbW1hbmRgIG9uIHRoZSBtYXN0ZXI6CkpPSU5fVE9LRU49IiIKSk9JTl9IQVNIX0ZVTEw9IiIKCiMgUHJvdmlkZXIgSUQgdG8gcmVnaXN0ZXIgd2l0aCBrdWJlbGV0IChleGFtcGxlIGJlbG93OyByZXBsYWNlIGlmIG5lZWRlZCkKUFJPVklERVJfSUQ9IiIKCiMgTXVsdGlwbGUgbGFiZWxzIGV4YW1wbGUgKGNvbW1hLXNlcGFyYXRlZCwgbm8gc3BhY2VzKQojIElNUE9SVEFOVDogZG8gbm90IGluY2x1ZGUgc3BhY2VzOyBzZXBhcmF0ZSBsYWJlbHMgd2l0aCBjb21tYXMgb25seS4KIyBLZXlzIG1heSBpbmNsdWRlICcvJycKTEFCRUxTPSIiCiMjIyA9PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0gIyMjCgpleHBvcnQgREVCSUFOX0ZST05URU5EPW5vbmludGVyYWN0aXZlCgplY2hvICJbMS8zXSBGYXN0IGV4aXQgaWYgYWxyZWFkeSBqb2luZWQiCmlmIFsgLWYgL2V0Yy9rdWJlcm5ldGVzL2t1YmVsZXQuY29uZiBdOyB0aGVuCiAgZWNobyAiTm9kZSBhbHJlYWR5IGpvaW5lZCAoL2V0Yy9rdWJlcm5ldGVzL2t1YmVsZXQuY29uZiBleGlzdHMpLiBOb3RoaW5nIHRvIGRvLiIKICBleGl0IDAKZmkKCgplY2hvICJbMi8zXSBQcmUtc2V0IGt1YmVsZXQgcHJvdmlkZXItaWQgYW5kIG5vZGUtbGFiZWxzICh2aWEgL2V0Yy9kZWZhdWx0L2t1YmVsZXQpIgoKIyAtLS0gUHJlY29uZGl0aW9uczogZmFpbCBmYXN0IGlmIGVtcHR5IC0tLQppZiBbIC16ICIke1BST1ZJREVSX0lEOi19IiBdOyB0aGVuCiAgZWNobyAiW2Vycm9yXSBQUk9WSURFUl9JRCBpcyBub3Qgc2V0IG9yIGlzIGVtcHR5IgogIGV4aXQgMQpmaQppZiBbIC16ICIke0xBQkVMUzotfSIgXTsgdGhlbgogIGVjaG8gIltlcnJvcl0gTEFCRUxTIGlzIG5vdCBzZXQgb3IgaXMgZW1wdHkiCiAgZXhpdCAxCmZpCgojIE9wdGlvbmFsOiBzdHJpcCBzcGFjZXMgdGhhdCBtaWdodCBzbmVhayBpbiAoZGVmZW5zaXZlKQpMQUJFTFM9IiQocHJpbnRmICclcycgIiRMQUJFTFMiIHwgdHIgLWQgJyAnKSIKCiMgQ3JlYXRlIGZpbGUgaWYgbWlzc2luZwpbIC1mIC9ldGMvZGVmYXVsdC9rdWJlbGV0IF0gfHwgOiA+IC9ldGMvZGVmYXVsdC9rdWJlbGV0CgojIFJlYWQgY3VycmVudCBhcmdzICh1bnF1b3RlZCkKQ1VSUkVOVD0iJChncmVwIC1vRSAnXktVQkVMRVRfRVhUUkFfQVJHUz0uKicgL2V0Yy9kZWZhdWx0L2t1YmVsZXQgfCBzZWQgJ3MvXHIkLy8nIHx8IHRydWUpIgpDVVJSRU5UPSIke0NVUlJFTlQjS1VCRUxFVF9FWFRSQV9BUkdTPX0iICAgICAgICAgICAgICAgICAgICAgICAgICAjIGRyb3AgcHJlZml4CkNVUlJFTlQ9IiR7Q1VSUkVOVCVcIn0iOyBDVVJSRU5UPSIke0NVUlJFTlQjXCJ9IiAgICAgICAgICAgICAgICAgICMgZHJvcCBzdXJyb3VuZGluZyBxdW90ZXMgaWYgYW55CgojIFJlbW92ZSBhbnkgcHJldmlvdXMgZmxhZ3MgdG8gYXZvaWQgZHVwbGljYXRpb24KQ0xFQU5FRD0iJChwcmludGYgJyVzXG4nICIkQ1VSUkVOVCIgXAogIHwgc2VkICdzLy0tcHJvdmlkZXItaWQ9W14gXSovL2cnIFwKICB8IHNlZCAncy8tLW5vZGUtbGFiZWxzPVteIF0qLy9nJyBcCiAgfCB4YXJncykiCgojIENvbnN0cnVjdCBuZXcgZmxhZ3MgKG11bHRpcGxlIGxhYmVscyBzdXBwb3J0ZWQgdmlhIGNvbW1hIGxpc3QpCk5FV19BUkdTPSIkKHByaW50ZiAnJXMgJXMgJXNcbicgIiRDTEVBTkVEIiAiLS1wcm92aWRlci1pZD0ke1BST1ZJREVSX0lEfSIgIi0tbm9kZS1sYWJlbHM9JHtMQUJFTFN9IiB8IHhhcmdzKSIKCiMgV3JpdGUgYmFjayAocXVvdGUgdG8gYmUgc2FmZSkKaWYgZ3JlcCAtcSAnXktVQkVMRVRfRVhUUkFfQVJHUz0nIC9ldGMvZGVmYXVsdC9rdWJlbGV0OyB0aGVuCiAgc2VkIC1pICdzI15LVUJFTEVUX0VYVFJBX0FSR1M9LiojS1VCRUxFVF9FWFRSQV9BUkdTPSInIiRORVdfQVJHUyInIiMnIC9ldGMvZGVmYXVsdC9rdWJlbGV0CmVsc2UKICBlY2hvICdLVUJFTEVUX0VYVFJBX0FSR1M9IiciJE5FV19BUkdTIiciJyA+PiAvZXRjL2RlZmF1bHQva3ViZWxldApmaQoKIyBTaG93IGV4YWN0bHkgd2hhdCB3ZSdsbCBydW4KZWNobyAiW3ByZWZsaWdodF0gL2V0Yy9kZWZhdWx0L2t1YmVsZXQgbm93IGlzOiIKc2VkIC1uICcxLDEyMHAnIC9ldGMvZGVmYXVsdC9rdWJlbGV0CgojIE1ha2Ugc3lzdGVtZCBwaWNrIGl0IHVwCnN5c3RlbWN0bCBkYWVtb24tcmVleGVjCnN5c3RlbWN0bCByZXN0YXJ0IGt1YmVsZXQgfHwgdHJ1ZQoKIyBIYXJkIHZlcmlmaWNhdGlvbiBCRUZPUkUgam9pbgppZiBncmVwIC1xIC0tICItLXByb3ZpZGVyLWlkPSR7UFJPVklERVJfSUR9IiAvZXRjL2RlZmF1bHQva3ViZWxldDsgdGhlbgogIGVjaG8gIltwcmVmbGlnaHRdIHByb3ZpZGVyLWlkIGNvbmZpZ3VyZWQiCmVsc2UKICBlY2hvICJbcHJlZmxpZ2h0XSBwcm92aWRlci1pZCBzdGlsbCBtaXNzaW5nIgogIGV4aXQgMQpmaQoKaWYgZ3JlcCAtcSAtLSAiLS1ub2RlLWxhYmVscz0ke0xBQkVMU30iIC9ldGMvZGVmYXVsdC9rdWJlbGV0OyB0aGVuCiAgZWNobyAiW3ByZWZsaWdodF0gbm9kZS1sYWJlbHMgY29uZmlndXJlZCIKZWxzZQogIGVjaG8gIltwcmVmbGlnaHRdIG5vZGUtbGFiZWxzIHN0aWxsIG1pc3NpbmciCiAgZXhpdCAxCmZpCgplY2hvICJbMi8zXSBKb2luIHRoZSBjbHVzdGVyIgprdWJlYWRtIGpvaW4gIiR7TUFTVEVSX0lQfToke01BU1RFUl9QT1JUfSIgXAogIC0tdG9rZW4gIiR7Sk9JTl9UT0tFTn0iIFwKICAtLWRpc2NvdmVyeS10b2tlbi1jYS1jZXJ0LWhhc2ggIiR7Sk9JTl9IQVNIX0ZVTEx9IiBcCiAgLS1ub2RlLW5hbWUgIiQoaG9zdG5hbWUpIgoKZWNobyAiRG9uZS4gS3ViZWxldCB3aWxsIHJlZ2lzdGVyIHdpdGggcHJvdmlkZXJJRD0nJHtQUk9WSURFUl9JRH0nIGFuZCBsYWJlbHM9JyR7TEFCRUxTfScuIgplY2hvICJWZXJpZnkgZnJvbSBtYXN0ZXI6IgplY2hvICIgIGt1YmVjdGwgZ2V0IG5vZGUgJChob3N0bmFtZSkgLW8ganNvbnBhdGg9J3suc3BlYy5wcm92aWRlcklEfSc7IGVjaG8iCmVjaG8gIiAga3ViZWN0bCBnZXQgbm9kZSAkKGhvc3RuYW1lKSAtLXNob3ctbGFiZWxzIHwgc2VkIC1FICdzLywvLFxuL2cnIHwgc2VkIC1uICcxLDVwJyIK",
       "startupScriptEnv": {
@@ -226,7 +229,9 @@ spec:
           type: RuntimeDefault
       serviceAccountName: cluster-autoscaler
       containers:
-      - image: registry.k8s.io/autoscaling/cluster-autoscaler:v1.30.0
+        # Replace <VERSION> with the first cluster-autoscaler release that
+        # includes the verdacloud provider (see https://github.com/kubernetes/autoscaler/releases).
+      - image: registry.k8s.io/autoscaling/cluster-autoscaler:<VERSION>
         name: cluster-autoscaler
         resources:
           limits:
@@ -243,7 +248,9 @@ spec:
         - --skip-nodes-with-local-storage=false
         - --expander=least-waste
         - --cloud-config=/etc/verdacloud/cluster-config.json
-        - --nodes=0:5:1A6000.10V:FIN-01:gpu-workers:hostname-prefix-here
+        # Format: min:max:instance-type:asg-name[:hostname-prefix]
+        # Locations are configured via cloudConfig.availableLocations, not here.
+        - --nodes=0:5:1A6000.10V:gpu-workers:hostname-prefix-here
         - --scale-down-delay-after-add=10m
         - --scale-down-unneeded-time=10m
         - --max-node-provision-time=15m

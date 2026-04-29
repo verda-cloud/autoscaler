@@ -40,6 +40,10 @@ type Asg struct {
 	AvailabilityLocations []string
 
 	scaleMutex sync.Mutex
+	// deleteMutex serializes DeleteNodes calls per-ASG so two concurrent
+	// callers cannot both observe the same curSize, both pass the min-size
+	// check independently, and overshoot minSize together.
+	deleteMutex sync.Mutex
 }
 
 // AsgRef is a reference to an Auto Scaling Group by name.
@@ -111,9 +115,14 @@ func (ng *VerdacloudNodeGroup) Belongs(node *apiv1.Node) (bool, error) {
 
 // DeleteNodes deletes the specified nodes from the node group.
 // Part of cloudprovider.NodeGroup interface — called from CA's background
-// deletion goroutines. Validates minSize and membership before delegating
-// to DeleteInstances for parallel API deletion + cache cleanup.
+// deletion goroutines. Acquires the per-ASG deleteMutex so that two concurrent
+// DeleteNodes calls on the same ASG can't both observe the same curSize, both
+// pass the min-size check independently, and overshoot minSize together.
+// Concurrent deletes across different ASGs still parallelize.
 func (ng *VerdacloudNodeGroup) DeleteNodes(nodes []*apiv1.Node) error {
+	ng.asg.deleteMutex.Lock()
+	defer ng.asg.deleteMutex.Unlock()
+
 	ng.manager.asgs.cacheMutex.RLock()
 	currentSize := ng.asg.curSize
 	minSize := ng.asg.minSize
@@ -151,21 +160,29 @@ func (ng *VerdacloudNodeGroup) ForceDeleteNodes(nodes []*apiv1.Node) error {
 // This only reduces the in-memory target counter (curSize) to correct for
 // unfulfilled capacity (e.g. instances that failed to register as nodes).
 // It must NOT delete any existing nodes — actual deletions happen in DeleteNodes.
+//
+// The min-size check and the curSize update are performed under a single
+// cacheMutex.Lock so two concurrent callers can't both observe the same
+// target, both pass the min-size check independently, and overshoot minSize
+// when their deltas combine.
 func (ng *VerdacloudNodeGroup) DecreaseTargetSize(delta int) error {
 	if delta >= 0 {
 		return fmt.Errorf("size decrease must be negative")
 	}
 
-	targetSize, _ := ng.TargetSize()
-	newTarget := targetSize + delta
-	if newTarget < ng.MinSize() {
+	ng.manager.asgs.cacheMutex.Lock()
+	defer ng.manager.asgs.cacheMutex.Unlock()
+
+	currentSize := ng.asg.curSize
+	newTarget := currentSize + delta
+	if newTarget < ng.asg.minSize {
 		return fmt.Errorf("attempt to decrease target to %d, but min size is %d for ASG %s",
-			newTarget, ng.MinSize(), ng.asg.Name)
+			newTarget, ng.asg.minSize, ng.asg.Name)
 	}
 
 	klog.V(4).Infof("DecreaseTargetSize ASG %s: %d -> %d",
-		ng.asg.Name, targetSize, newTarget)
-	ng.manager.asgs.adjustTargetSize(ng.asg, delta)
+		ng.asg.Name, currentSize, newTarget)
+	ng.asg.curSize += delta
 	return nil
 }
 

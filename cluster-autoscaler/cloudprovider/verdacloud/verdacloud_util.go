@@ -255,6 +255,9 @@ func isGPUInstanceType(instanceType string) bool {
 }
 
 func instanceRefFromProviderId(providerId string) (*InstanceRef, error) {
+	if !strings.HasPrefix(providerId, verdacloudProviderIDPrefix) {
+		return nil, fmt.Errorf("not a VerdaCloud provider ID: %s", providerId)
+	}
 	providerIdBase := strings.TrimPrefix(providerId, verdacloudProviderIDPrefix)
 	parts := strings.Split(providerIdBase, "/")
 	if len(parts) < 2 {
