@@ -71,6 +71,8 @@ The JSON above is the authoritative format. This table summarizes top‑level ke
 | startupScriptEnv | map<string,string> | required | — | Environment variables for the startup script. Must align with `startupScript`. |
 | taints | array<object> | optional | — | Standard k8s taint objects applied to nodes |
 | groups | map<string,object> | optional | — | Node group definitions overriding defaults. See below for supported keys. |
+| reapOrphanNodes | bool | optional | false | Opt-in: when true, the autoscaler deletes K8s `Node` objects whose VerdaCloud VMs have disappeared from the API. Intended only for clusters that **do not** run a verdacloud cloud-controller-manager. Once a CCM is deployed it owns Node lifecycle and this flag should remain off. See [Orphan-node reaping](#orphan-node-reaping) below. |
+| reapOrphanNodesAfterCycles | int | optional | 3 | Number of consecutive `Refresh` cycles a hostname must be absent from the VerdaCloud API before its `Node` is deleted. Guards against deleting healthy Nodes on a single bad API response. Only consulted when `reapOrphanNodes` is true. |
 
 ### Group Configuration Overrides
 The `groups` map allows defining overrides for specific Auto Scaling Groups (ASGs). The format is `"asg-name": { ... }`.
@@ -158,6 +160,40 @@ make push-image BUILD_TAGS=verdacloud TAG='dev' REGISTRY='verdacloud'
 ```
 
 **Note:** The `make-image` command automatically builds the code inside Docker, so no separate build step is needed.
+
+## Orphan-node reaping
+
+`reapOrphanNodes` is an opt-in transitional feature for clusters that do not
+yet run a verdacloud cloud-controller-manager (CCM). Without a CCM, when a
+VerdaCloud VM is deleted (manually, by the autoscaler, or by VerdaCloud)
+nothing removes the corresponding Kubernetes `Node` object — orphan Nodes
+linger as `NotReady` forever.
+
+When `reapOrphanNodes` is `true`, on each `Refresh` the autoscaler:
+
+1. Lists Nodes whose `providerID` has the `verdacloud://` prefix.
+2. Filters to hostnames whose prefix matches one of the registered ASGs
+   (so manually-provisioned VerdaCloud VMs such as control-plane nodes
+   are never touched).
+3. For each remaining Node whose hostname is absent from the latest VerdaCloud
+   API response, increments a per-hostname missing-cycle counter.
+4. Deletes the Node only after the counter reaches
+   `reapOrphanNodesAfterCycles` (default `3`). The counter resets when the
+   hostname reappears in a later API response.
+
+This avoids deleting healthy Nodes on a single bad API response (e.g. a
+truncated paginated list). With the default cycle count and a 1-minute
+refresh interval, deletion happens roughly 3 minutes after a VM goes missing.
+
+When this flag is enabled, the cluster-autoscaler ServiceAccount must have
+`delete` permission on `nodes`. The example deployment manifest grants this
+permission unconditionally; if you keep `reapOrphanNodes: false`, you may
+remove the `delete` verb from the `nodes` ClusterRole rule for least privilege.
+
+**Recommendation**: deploy a verdacloud CCM
+(`verdacloud-cloud-controller-manager`) and leave `reapOrphanNodes` at its
+default `false`. The CCM owns Node lifecycle by design, follows Kubernetes
+conventions, and doesn't require the autoscaler to hold `nodes/delete`.
 
 ## Support and caveats
 
