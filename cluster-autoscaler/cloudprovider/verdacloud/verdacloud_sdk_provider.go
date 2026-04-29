@@ -17,6 +17,7 @@ limitations under the License.
 package verdacloud
 
 import (
+	"fmt"
 	"os"
 	"time"
 
@@ -25,8 +26,12 @@ import (
 )
 
 const (
-	// UserAgent identifies the cluster autoscaler in API requests
+	// Identifies the autoscaler in API requests.
 	autoscalerUserAgent = "cluster-autoscaler/verdacloud"
+
+	// Retry budget for transient SDK failures.
+	sdkMaxRetries     = 3
+	sdkInitialBackoff = time.Second
 )
 
 type verdacloudSDKProvider struct {
@@ -37,6 +42,10 @@ func createVerdacloudSDKProvider(cfg *cloudConfig) (*verdacloudSDKProvider, erro
 	clientID := os.Getenv("VERDA_CLIENT_ID")
 	clientSecret := os.Getenv("VERDA_CLIENT_SECRET")
 	baseURL := os.Getenv("VERDA_BASE_URL")
+
+	if clientID == "" || clientSecret == "" {
+		return nil, fmt.Errorf("VERDA_CLIENT_ID and VERDA_CLIENT_SECRET environment variables must be set")
+	}
 
 	verdaDebug := os.Getenv("VERDA_DEBUG")
 	detailedDebugEnabled := verdaDebug == "true" || verdaDebug == "1"
@@ -60,7 +69,7 @@ func createVerdacloudSDKProvider(cfg *cloudConfig) (*verdacloudSDKProvider, erro
 		clientOpts = append(clientOpts, verda.WithBaseURL(baseURL))
 		klog.V(4).Infof("Using VerdaCloud API base URL from VERDA_BASE_URL: %s", baseURL)
 	} else {
-		klog.V(4).Infof("Using default VerdaCloud API base URL: https://api.verda.com/v1")
+		klog.V(4).Infof("Using default VerdaCloud API base URL: %s", verda.DefaultBaseURL)
 	}
 
 	client, err := verda.NewClient(clientOpts...)
@@ -69,7 +78,7 @@ func createVerdacloudSDKProvider(cfg *cloudConfig) (*verdacloudSDKProvider, erro
 	}
 
 	client.AddRequestMiddleware(
-		verda.ExponentialBackoffRetryMiddleware(3, time.Second, logger),
+		verda.ExponentialBackoffRetryMiddleware(sdkMaxRetries, sdkInitialBackoff, logger),
 	)
 
 	if detailedDebugEnabled {
@@ -77,7 +86,7 @@ func createVerdacloudSDKProvider(cfg *cloudConfig) (*verdacloudSDKProvider, erro
 		klog.V(4).Info("VerdaCloud SDK detailed debug logging enabled (VERDA_DEBUG=true)")
 	}
 
-	klog.V(4).Info("VerdaCloud SDK client created with retry middleware enabled (max 3 retries, exponential backoff)")
+	klog.V(4).Infof("VerdaCloud SDK client created with retry middleware enabled (max %d retries, exponential backoff from %s)", sdkMaxRetries, sdkInitialBackoff)
 
 	return &verdacloudSDKProvider{
 		client: client,

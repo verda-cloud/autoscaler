@@ -42,6 +42,10 @@ type Asg struct {
 	scaleMutex sync.Mutex
 	// targetSizeMutex serializes DeleteNodes and DecreaseTargetSize per-ASG
 	// to keep concurrent target-size decreases from breaching minSize.
+	//
+	// Lock ordering: when both targetSizeMutex and the manager's cacheMutex
+	// are needed, take targetSizeMutex first (outer, per-ASG) then cacheMutex
+	// (inner, manager-wide). Inverting this order will deadlock.
 	targetSizeMutex sync.Mutex
 }
 
@@ -112,9 +116,7 @@ func (ng *VerdacloudNodeGroup) Belongs(node *apiv1.Node) (bool, error) {
 	return targetAsg.Name == ng.asg.Name, nil
 }
 
-// DeleteNodes deletes the given nodes from the node group, holding
-// targetSizeMutex so concurrent target-size operations on the same ASG
-// cannot together overshoot minSize.
+// DeleteNodes safely removes given nodes while holding targetSizeMutex to protect minSize.
 func (ng *VerdacloudNodeGroup) DeleteNodes(nodes []*apiv1.Node) error {
 	ng.asg.targetSizeMutex.Lock()
 	defer ng.asg.targetSizeMutex.Unlock()
@@ -152,10 +154,8 @@ func (ng *VerdacloudNodeGroup) ForceDeleteNodes(nodes []*apiv1.Node) error {
 	return cloudprovider.ErrNotImplemented
 }
 
-// DecreaseTargetSize lowers curSize to reflect unfulfilled capacity (e.g.
-// instances that never registered). It does not delete VMs — that's
-// DeleteNodes's job. Both share targetSizeMutex to keep concurrent decreases
-// from pushing curSize below minSize.
+// DecreaseTargetSize adjusts curSize for unprovisioned capacity (see: DeleteNodes for VM removal).
+// Both use targetSizeMutex: link to design notes in comments above ASG struct.
 func (ng *VerdacloudNodeGroup) DecreaseTargetSize(delta int) error {
 	if delta >= 0 {
 		return fmt.Errorf("size decrease must be negative")
@@ -197,8 +197,7 @@ func (ng *VerdacloudNodeGroup) Nodes() ([]cloudprovider.Instance, error) {
 func (ng *VerdacloudNodeGroup) TemplateNodeInfo() (*schedulerframework.NodeInfo, error) {
 	ctx := context.Background()
 	klog.V(4).Infof("TemplateNodeInfo called for ASG %s", ng.asg.Name)
-	asgRef := AsgRef{Name: ng.asg.Name}
-	template, err := ng.manager.getAsgTemplate(ctx, asgRef)
+	template, err := ng.manager.getAsgTemplate(ctx, ng.asg.AsgRef)
 	if err != nil {
 		klog.Errorf("Failed to get template for ASG %s: %v", ng.asg.Name, err)
 		return nil, err
@@ -221,10 +220,9 @@ func (ng *VerdacloudNodeGroup) Exist() bool {
 	if ng.asg == nil {
 		return false
 	}
-	asgRef := AsgRef{Name: ng.asg.Name}
-	asg, err := ng.manager.GetAsgByRef(asgRef)
+	asg, err := ng.manager.GetAsgByRef(ng.asg.AsgRef)
 	if err != nil {
-		klog.V(4).Infof("Error getting ASG by ref %s: %v", asgRef.Name, err)
+		klog.V(4).Infof("Error getting ASG by ref %s: %v", ng.asg.Name, err)
 		return false
 	}
 	return asg != nil

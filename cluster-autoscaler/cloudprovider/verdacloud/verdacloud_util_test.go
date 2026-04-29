@@ -284,7 +284,10 @@ LABELS=""
 				"LABELS":      labelsStr,
 			}
 
-			patched := injectEnvVarsIntoScript(script, envMap)
+			patched, err := injectEnvVarsIntoScript(script, envMap)
+			if err != nil {
+				t.Fatalf("injectEnvVarsIntoScript: %v", err)
+			}
 			patchedStr := string(patched)
 
 			for _, expected := range tc.expectContains {
@@ -584,7 +587,11 @@ ANOTHER_VAR=""
 		"ANOTHER_VAR": "also-replaced",
 	}
 
-	result := string(injectEnvVarsIntoScript(script, envMap))
+	patched, err := injectEnvVarsIntoScript(script, envMap)
+	if err != nil {
+		t.Fatalf("injectEnvVarsIntoScript: %v", err)
+	}
+	result := string(patched)
 
 	// Variables outside heredoc should be replaced
 	if !strings.Contains(result, `MY_VAR="replaced-value"`) {
