@@ -10,6 +10,8 @@ The cluster autoscaler for VerdaCloud (formerly DataCrunch.io) scales worker nod
 
 `VERDA_BASE_URL` Optional VerdaCloud API base URL. Defaults to `https://api.verda.com/v1`.
 
+`VERDA_DEBUG` Optional. Set to `true` or `1` to enable SDK-level detailed logging (request/response traces from the verdacloud SDK). Independent of the `debug` field in the JSON config — either one enables verbose SDK logging.
+
 `VERDA_CLUSTER_CONFIG` Base64 encoded JSON according to the following structure:
 
 ```json
@@ -61,9 +63,9 @@ The JSON above is the authoritative format. This table summarizes top‑level ke
 | image.gpu | string | required | — | Image for GPU nodes provided by VerdaCloud (current: k8s 1.31.1, cuda 12.9). Contact us for other versions. |
 | image.cpu | string | required | — | Image for CPU nodes provided by VerdaCloud (current: k8s 1.31.1, cuda 12.9). Contact us for other versions. |
 | sshKeyIDs | array<string> | required | — | SSH key IDs to inject. See [Fetching SSH Keys](#fetching-ssh-keys) for details. |
-| billingConfig.price | string | required | — | Must be `FIXED_PRICE`. |
-| billingConfig.contract | string | optional | — | One of LONG_TERM, PAY_AS_YOU_GO, or SPOT |
-| debug | bool | optional | false | Enables additional provider‑side diagnostics |
+| billingConfig.price | string | optional | `FIXED_PRICE` | Pricing mode. Currently only `FIXED_PRICE` is supported by the API; left empty, the provider sets it to that default. |
+| billingConfig.contract | string | optional | `PAY_AS_YOU_GO` | One of `LONG_TERM`, `PAY_AS_YOU_GO`, or `SPOT`. Empty defaults to `PAY_AS_YOU_GO`. |
+| debug | bool | optional | false | Enables verbose logging from the verdacloud SDK (request/response traces). Equivalent to setting `VERDA_DEBUG=true` as an environment variable. |
 | availableLocations | array<string> | required | — | Location codes eligible for provisioning. Group config overwrites global. |
 | osVolumeSize | int | optional | 50 | Size of the OS volume in GB. Group config overwrites global. |
 | labels | array<string> | optional | — | Labels to apply to all nodes. Group config merges with global. |
@@ -78,10 +80,11 @@ The JSON above is the authoritative format. This table summarizes top‑level ke
 The `groups` map allows defining overrides for specific Auto Scaling Groups (ASGs). The format is `"asg-name": { ... }`.
 Supported override keys within a group object:
 - `labels`: Merges with global labels. Overwrites value if conflict with global label.
-- `taints`: Merges with global group. Overwrites value if conflict with global.
+- `taints`: Merges with global taints. Overwrites value if conflict with global.
 - `availableLocations`: Overwrites global available locations.
 - `billingConfig`: Overwrites global billing config.
-- `osVolumeSize`: Overwrites global OS volume size.
+- `osVolumeSize`: Overwrites global OS volume size. Below 50GB falls back to the global value (or default 50).
+- `additionalVolumes`: Per-ASG list of extra volumes (`name`, `size`, `type`) attached on instance creation. Group-only; there is no global equivalent.
 
 
 `VERDA_CLUSTER_CONFIG_FILE` Can be used as alternative to `VERDA_CLUSTER_CONFIG`. This is the path to a file containing the JSON structure described above. The file will be read and the contents will be used as the configuration.
@@ -133,7 +136,7 @@ Multiple flags will create multiple node pools. For example:
 --nodes=1:5:1A100.22V:as-test-1a10022v:custom-node
 ```
 
-The last example uses a custom hostname prefix `custom-node`, so instances will be named like `custom-node-vm-fin-03-42` instead of `as-test-1a10022v-vm-fin-03-42`.
+The last example uses a custom hostname prefix `custom-node`, so instances will be named like `custom-node-vm-fin-03-1a2b3c4d` instead of `as-test-1a10022v-vm-fin-03-1a2b3c4d`. The `1a2b3c4d` suffix is an 8-character lowercase hex value derived from a random `uint32`.
 
 You can find a complete deployment sample under [examples/cluster-autoscaler-deployment-example.yaml](examples/cluster-autoscaler-deployment-example.yaml). This single file contains all required Kubernetes resources including namespace, RBAC, secrets, configmap, and deployment. Please be aware that you should change the values within this deployment to reflect your cluster:
 
@@ -197,11 +200,13 @@ conventions, and doesn't require the autoscaler to hold `nodes/delete`.
 
 ## Support and caveats
 
-- Hostname format: Instances created by this provider include an internal magic separator in their hostname that encodes the ASG name or custom hostname prefix (format: `{hostname-prefix|asg-name}-vm-{location-lowercase}-{random-2-digits}`). The autoscaler relies on this to identify group membership. Examples: `custom-node-vm-fin-03-42` or `as-test-1a100-vm-fin-03-87`.
+- Hostname format: Instances created by this provider include an internal magic separator (`-vm-`) in their hostname that encodes the ASG name or custom hostname prefix (format: `{hostname-prefix|asg-name}-vm-{location-lowercase}-{8-char-hex}`). The 8-character hex suffix is `fmt.Sprintf("%08x", rand.Uint32())`. The autoscaler relies on this magic separator to identify group membership. Examples: `custom-node-vm-fin-03-1a2b3c4d` or `as-test-1a100-vm-fin-03-deadbeef`.
 - No legacy fallback: If instances are created outside this provider with different hostname conventions, they may not be associated with the expected ASG by the autoscaler.
 - ProviderID format: `verdacloud://<location>/<hostname>`.
 
 ## Debugging
 
-To enable debug logging, run the autoscaler with `--v=4` or higher.
-At `--v=7` the autoscaler logs CreateInstance request bodies for troubleshooting; response bodies and headers are not logged.
+Two independent log channels:
+
+- **Cluster-autoscaler verbosity (`--v=N`)** — controls the standard `klog` output from this provider. The provider logs at `--v=4` (informational, e.g. ASG registration, scale-up/down decisions, sweep cycle counts) and `--v=5` (per-instance availability checks). Higher levels (`--v=6+`) emit more detail from the cluster-autoscaler core but no additional provider-specific output.
+- **VerdaCloud SDK detailed logging** — enabled by setting either the `debug` field in the JSON config to `true`, or the `VERDA_DEBUG` env var to `true`/`1`. This causes the SDK to log full HTTP request/response traces, useful for API-level troubleshooting. Disabled by default.
