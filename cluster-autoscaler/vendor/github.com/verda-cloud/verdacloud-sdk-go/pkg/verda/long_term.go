@@ -4,6 +4,16 @@ import (
 	"context"
 )
 
+// LongTermPeriod represents a long-term rental period option
+type LongTermPeriod struct {
+	Code               string  `json:"code"`
+	Name               string  `json:"name"`
+	IsEnabled          bool    `json:"is_enabled"`
+	UnitName           string  `json:"unit_name"`
+	UnitValue          int     `json:"unit_value"`
+	DiscountPercentage float64 `json:"discount_percentage"`
+}
+
 type LongTermService struct {
 	client *Client
 }

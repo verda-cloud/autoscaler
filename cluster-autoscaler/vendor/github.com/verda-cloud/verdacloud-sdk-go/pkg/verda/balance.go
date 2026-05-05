@@ -2,6 +2,12 @@ package verda
 
 import "context"
 
+// Balance represents account balance information
+type Balance struct {
+	Amount   float64 `json:"amount"`
+	Currency string  `json:"currency"`
+}
+
 type BalanceService struct {
 	client *Client
 }

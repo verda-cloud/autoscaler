@@ -44,8 +44,11 @@ func (s *VolumeService) GetVolume(ctx context.Context, id string) (*Volume, erro
 }
 
 func (s *VolumeService) CreateVolume(ctx context.Context, req VolumeCreateRequest) (string, error) {
+	if err := req.Validate(); err != nil {
+		return "", err
+	}
 	if req.LocationCode == "" {
-		req.LocationCode = LocationFIN01
+		req.LocationCode = LocationFIN03
 	}
 
 	return s.createVolumeWithPlainTextResponse(ctx, req)
@@ -73,6 +76,15 @@ func (s *VolumeService) createVolumeWithPlainTextResponse(ctx context.Context, r
 	return volumeID, nil
 }
 
+// GetVolumesInTrash returns all volumes that are in trash
+func (s *VolumeService) GetVolumesInTrash(ctx context.Context) ([]VolumeInTrash, error) {
+	volumes, _, err := getRequest[[]VolumeInTrash](ctx, s.client, "/volumes/trash")
+	if err != nil {
+		return nil, err
+	}
+	return volumes, nil
+}
+
 func (s *VolumeService) DeleteVolume(ctx context.Context, id string, force bool) error {
 	path := fmt.Sprintf("/volumes/%s", id)
 	if force {
@@ -85,7 +97,9 @@ func (s *VolumeService) DeleteVolume(ctx context.Context, id string, force bool)
 
 // AttachVolume attaches a volume - instance must be shut down first
 func (s *VolumeService) AttachVolume(ctx context.Context, volumeID string, req VolumeAttachRequest) error {
-	// Use map to combine action fields with instance_id
+	if err := req.Validate(); err != nil {
+		return err
+	}
 	payload := map[string]interface{}{
 		"id":          volumeID,
 		"action":      VolumeActionAttach,
@@ -97,6 +111,9 @@ func (s *VolumeService) AttachVolume(ctx context.Context, volumeID string, req V
 
 // DetachVolume detaches a volume - instance must be shut down first
 func (s *VolumeService) DetachVolume(ctx context.Context, volumeID string, req VolumeDetachRequest) error {
+	if err := req.Validate(); err != nil {
+		return err
+	}
 	payload := map[string]interface{}{
 		"id":          volumeID,
 		"action":      VolumeActionDetach,
@@ -108,6 +125,9 @@ func (s *VolumeService) DetachVolume(ctx context.Context, volumeID string, req V
 
 // CloneVolume clones a volume and returns the new volume ID
 func (s *VolumeService) CloneVolume(ctx context.Context, volumeID string, req VolumeCloneRequest) (string, error) {
+	if err := req.Validate(); err != nil {
+		return "", err
+	}
 	actionReq := VolumeActionRequest{
 		ID:     volumeID,
 		Action: VolumeActionClone,
@@ -149,6 +169,9 @@ func (s *VolumeService) CloneVolume(ctx context.Context, volumeID string, req Vo
 
 // ResizeVolume grows a volume - shrinking is not supported
 func (s *VolumeService) ResizeVolume(ctx context.Context, volumeID string, req VolumeResizeRequest) error {
+	if err := req.Validate(); err != nil {
+		return err
+	}
 	actionReq := VolumeActionRequest{
 		ID:     volumeID,
 		Action: VolumeActionResize,
@@ -159,6 +182,9 @@ func (s *VolumeService) ResizeVolume(ctx context.Context, volumeID string, req V
 }
 
 func (s *VolumeService) RenameVolume(ctx context.Context, volumeID string, req VolumeRenameRequest) error {
+	if err := req.Validate(); err != nil {
+		return err
+	}
 	actionReq := VolumeActionRequest{
 		ID:     volumeID,
 		Action: VolumeActionRename,

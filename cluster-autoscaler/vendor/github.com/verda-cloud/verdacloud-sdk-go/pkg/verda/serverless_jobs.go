@@ -19,7 +19,10 @@ func (s *ServerlessJobsService) GetJobDeployments(ctx context.Context) ([]JobDep
 }
 
 func (s *ServerlessJobsService) CreateJobDeployment(ctx context.Context, req *CreateJobDeploymentRequest) (*JobDeployment, error) {
-	if err := validateCreateJobDeploymentRequest(req); err != nil {
+	if req == nil {
+		return nil, fmt.Errorf("request cannot be nil")
+	}
+	if err := req.Validate(); err != nil {
 		return nil, err
 	}
 
@@ -30,57 +33,24 @@ func (s *ServerlessJobsService) CreateJobDeployment(ctx context.Context, req *Cr
 	return &job, nil
 }
 
-// validateCreateJobDeploymentRequest validates all required fields for job deployment creation
-func validateCreateJobDeploymentRequest(req *CreateJobDeploymentRequest) error {
-	if req == nil {
-		return fmt.Errorf("request cannot be nil")
-	}
-
-	// Basic required fields
-	if req.Name == "" {
-		return fmt.Errorf("name is required")
-	}
-	if req.Compute == nil {
-		return fmt.Errorf("compute is required")
-	}
-	if req.Compute.Name == "" {
-		return fmt.Errorf("compute.name is required")
-	}
-
-	// Container validation
-	if len(req.Containers) == 0 {
-		return fmt.Errorf("at least one container is required")
-	}
-	for i, c := range req.Containers {
-		if c.Image == "" {
-			return fmt.Errorf("containers[%d].image is required", i)
-		}
-		// Check for "latest" tag - API does not allow it
-		if isLatestTag(c.Image) {
-			return fmt.Errorf("containers[%d].image: 'latest' tag is not allowed, please specify a specific version tag (e.g., alpine:3.19)", i)
-		}
-	}
-
-	// Scaling validation
-	if req.Scaling == nil {
-		return fmt.Errorf("scaling is required")
-	}
-	if req.Scaling.MaxReplicaCount == 0 {
-		return fmt.Errorf("scaling.max_replica_count is required")
-	}
-	if req.Scaling.DeadlineSeconds == 0 {
-		return fmt.Errorf("scaling.deadline_seconds is required (job timeout in seconds)")
-	}
-	if req.Scaling.QueueMessageTTLSeconds == 0 {
-		return fmt.Errorf("scaling.queue_message_ttl_seconds is required")
-	}
-
-	return nil
-}
-
 func (s *ServerlessJobsService) GetJobDeploymentByName(ctx context.Context, jobName string) (*JobDeployment, error) {
 	path := fmt.Sprintf("/job-deployments/%s", jobName)
 	job, _, err := getRequest[JobDeployment](ctx, s.client, path)
+	if err != nil {
+		return nil, err
+	}
+	return &job, nil
+}
+
+func (s *ServerlessJobsService) UpdateJobDeployment(ctx context.Context, jobName string, req *UpdateJobDeploymentRequest) (*JobDeployment, error) {
+	if req == nil {
+		return nil, fmt.Errorf("request cannot be nil")
+	}
+	if jobName == "" {
+		return nil, fmt.Errorf("jobName is required")
+	}
+	path := fmt.Sprintf("/job-deployments/%s", jobName)
+	job, _, err := patchRequest[JobDeployment](ctx, s.client, path, req)
 	if err != nil {
 		return nil, err
 	}
@@ -96,17 +66,15 @@ func (s *ServerlessJobsService) GetJobDeploymentByName(ctx context.Context, jobN
 func (s *ServerlessJobsService) DeleteJobDeployment(ctx context.Context, jobName string, timeoutMs int) error {
 	path := fmt.Sprintf("/job-deployments/%s", jobName)
 
-	// Handle timeout parameter based on API specification
 	if timeoutMs >= 0 {
 		timeout := timeoutMs
 		if timeout > 300000 {
-			timeout = 300000 // cap at max 300 seconds
+			timeout = 300000
 		}
 		params := url.Values{}
 		params.Set("timeout", fmt.Sprintf("%d", timeout))
 		path += "?" + params.Encode()
 	}
-	// If timeoutMs < 0, don't add timeout parameter (use API default)
 
 	_, err := deleteRequestAllowEmptyResponse(ctx, s.client, path)
 	return err

@@ -6,7 +6,19 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
+
+	validation "github.com/go-ozzo/ozzo-validation/v4"
 )
+
+// SSHKey represents an SSH key
+type SSHKey struct {
+	ID          string    `json:"id"`
+	Name        string    `json:"name"`
+	PublicKey   string    `json:"key"`
+	Fingerprint string    `json:"fingerprint"`
+	CreatedAt   time.Time `json:"created_at"`
+}
 
 type SSHKeyService struct {
 	client *Client
@@ -19,6 +31,14 @@ type CreateSSHKeyRequest struct {
 
 type DeleteMultipleSSHKeysRequest struct {
 	Keys []string `json:"keys"`
+}
+
+// Validate validates the CreateSSHKeyRequest fields
+func (r CreateSSHKeyRequest) Validate() error {
+	return validation.ValidateStruct(&r,
+		validation.Field(&r.Name, validation.Required),
+		validation.Field(&r.PublicKey, validation.Required),
+	)
 }
 
 func (s *SSHKeyService) GetAllSSHKeys(ctx context.Context) ([]SSHKey, error) {
@@ -47,6 +67,9 @@ func (s *SSHKeyService) GetSSHKeyByID(ctx context.Context, sshKeyID string) (*SS
 
 // AddSSHKey creates a key and refetches it since the API returns only the ID as plain text
 func (s *SSHKeyService) AddSSHKey(ctx context.Context, req *CreateSSHKeyRequest) (*SSHKey, error) {
+	if err := req.Validate(); err != nil {
+		return nil, err
+	}
 	return s.createWithPlainTextResponse(ctx, req)
 }
 

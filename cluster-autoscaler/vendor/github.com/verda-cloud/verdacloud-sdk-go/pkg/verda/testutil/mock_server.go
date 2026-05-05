@@ -50,6 +50,58 @@ const mockScalingOptionsResponse = `{
 	}
 }`
 
+const mockUpdatedContainerDeploymentResponse = `{
+	"name": "test-deployment",
+	"containers": [
+		{
+			"name": "updated-container",
+			"image": {
+				"image": "nginx:latest",
+				"last_updated_at": "2024-01-01T00:00:00.000Z"
+			},
+			"exposed_port": 8080
+		}
+	],
+	"endpoint_base_url": "https://containers.datacrunch.io/test-deployment",
+	"created_at": "2024-01-01T00:00:00.000Z",
+	"compute": {
+		"name": "H100",
+		"size": 1
+	},
+	"container_registry_settings": {
+		"is_private": false
+	},
+	"is_spot": false
+}`
+
+const mockUpdatedJobDeploymentResponse = `{
+	"name": "test-job",
+	"containers": [
+		{
+			"name": "updated-job-container",
+			"image": {
+				"image": "registry-1.docker.io/chentex/random-logger:v1.0.1",
+				"last_updated_at": "2025-11-26T16:37:50.932Z"
+			},
+			"exposed_port": 8080
+		}
+	],
+	"endpoint_base_url": "https://containers.datacrunch.io/test-job",
+	"created_at": "2021-08-31T12:00:00.000Z",
+	"compute": {
+		"name": "H100",
+		"size": 1
+	},
+	"container_registry_settings": {
+		"is_private": false
+	},
+	"scaling": {
+		"max_replica_count": 2,
+		"queue_message_ttl_seconds": 300,
+		"deadline_seconds": 3600
+	}
+}`
+
 // TestClientConfig holds configuration for creating test clients
 type TestClientConfig struct {
 	BaseURL      string
@@ -149,14 +201,47 @@ type Location struct {
 	Available   bool   `json:"available"`
 }
 
+type VolumeAttachedInstance struct {
+	ID                  string  `json:"id"`
+	AutoRentalExtension *bool   `json:"auto_rental_extension"`
+	IP                  *string `json:"ip"`
+	InstanceType        string  `json:"instance_type"`
+	Status              string  `json:"status"`
+	OSVolumeID          *string `json:"os_volume_id"`
+	Hostname            string  `json:"hostname"`
+}
+
+type VolumeLongTerm struct {
+	EndDate             time.Time `json:"end_date"`
+	LongTermPeriod      string    `json:"long_term_period"`
+	DiscountPercentage  int       `json:"discount_percentage"`
+	AutoRentalExtension bool      `json:"auto_rental_extension"`
+	NextPeriodPrice     float64   `json:"next_period_price"`
+	CurrentPeriodPrice  float64   `json:"current_period_price"`
+}
+
 type Volume struct {
-	ID         string    `json:"id"`
-	Name       string    `json:"name"`
-	Size       int       `json:"size"`
-	Type       string    `json:"type"`
-	Status     string    `json:"status"`
-	CreatedAt  time.Time `json:"created_at"`
-	InstanceID *string   `json:"instance_id"`
+	ID                       string                   `json:"id"`
+	Name                     string                   `json:"name"`
+	Size                     int                      `json:"size"`
+	Type                     string                   `json:"type"`
+	Status                   string                   `json:"status"`
+	CreatedAt                time.Time                `json:"created_at"`
+	InstanceID               *string                  `json:"instance_id"`
+	Instances                []VolumeAttachedInstance `json:"instances"`
+	Location                 string                   `json:"location"`
+	Contract                 string                   `json:"contract,omitempty"`
+	IsOSVolume               bool                     `json:"is_os_volume"`
+	Target                   *string                  `json:"target"`
+	SSHKeyIDs                []string                 `json:"ssh_key_ids"`
+	PseudoPath               *string                  `json:"pseudo_path"`
+	CreateDirectoryCommand   *string                  `json:"create_directory_command"`
+	MountCommand             *string                  `json:"mount_command"`
+	FilesystemToFstabCommand *string                  `json:"filesystem_to_fstab_command"`
+	BaseHourlyCost           float64                  `json:"base_hourly_cost"`
+	MonthlyPrice             float64                  `json:"monthly_price"`
+	Currency                 string                   `json:"currency"`
+	LongTerm                 *VolumeLongTerm          `json:"long_term"`
 }
 
 type StartupScript struct {
@@ -177,8 +262,9 @@ type VolumeType struct {
 }
 
 type VolumeTypePrice struct {
-	MonthlyPerGB float64 `json:"monthly_per_gb"`
-	Currency     string  `json:"currency"`
+	PricePerMonthPerGB float64 `json:"price_per_month_per_gb"`
+	CPSPerGB           float64 `json:"cps_per_gb"`
+	Currency           string  `json:"currency"`
 }
 
 type Image struct {
@@ -356,7 +442,7 @@ type ClusterImage struct {
 const (
 	StatusRunning = "running"
 	StatusPending = "pending"
-	LocationFIN01 = "FIN-01"
+	LocationFIN03 = "FIN-03"
 	pathInstances = "/instances"
 	// nolint:gosec // G101: This is a URL path, not a credential
 	pathOAuth2Token = "/oauth2/token"
@@ -524,6 +610,8 @@ func (ms *MockServer) handleRequest(w http.ResponseWriter, r *http.Request) {
 		ms.handleGetJobDeployments(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/job-deployments":
 		ms.handleCreateJobDeployment(w, r)
+	case r.Method == http.MethodPatch && strings.HasPrefix(r.URL.Path, "/job-deployments/"):
+		ms.handleUpdateJobDeployment(w, r)
 	case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/scaling") && strings.HasPrefix(r.URL.Path, "/job-deployments/"):
 		ms.handleGetJobDeploymentScaling(w, r)
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/job-deployments/"):
@@ -557,13 +645,13 @@ func (ms *MockServer) handleAuth(w http.ResponseWriter, r *http.Request) {
 		clientSecret = tokenReq.ClientSecret
 	} else {
 		// Parse form data
-		if err := r.ParseForm(); err != nil {
+		if err := r.ParseForm(); err != nil { //nolint:gosec // G120: test mock server, not production
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		grantType = r.FormValue("grant_type")
-		clientID = r.FormValue("client_id")
-		clientSecret = r.FormValue("client_secret")
+		grantType = r.FormValue("grant_type")       //nolint:gosec // G120: test mock server
+		clientID = r.FormValue("client_id")         //nolint:gosec // G120: test mock server
+		clientSecret = r.FormValue("client_secret") //nolint:gosec // G120: test mock server
 	}
 
 	if grantType == "" || clientID == "" || clientSecret == "" {
@@ -592,7 +680,7 @@ func (ms *MockServer) handleGetInstances(w http.ResponseWriter, _ *http.Request)
 	osVolumeID := "vol_os_123"
 
 	instances := []Instance{
-		{
+		{ //nolint:gosec // G101: test fixture, not real credentials
 			ID:              "inst_123",
 			IP:              &ip,
 			Status:          StatusRunning,
@@ -604,7 +692,7 @@ func (ms *MockServer) handleGetInstances(w http.ResponseWriter, _ *http.Request)
 			Storage:         map[string]interface{}{"description": "100GB SSD"},
 			Hostname:        "test-instance",
 			Description:     "Test instance",
-			Location:        LocationFIN01,
+			Location:        LocationFIN03,
 			PricePerHour:    0.50,
 			IsSpot:          false,
 			InstanceType:    "1V100.6V",
@@ -639,7 +727,7 @@ func (ms *MockServer) handleGetInstance(w http.ResponseWriter, r *http.Request) 
 	scriptID := "script_123"
 	osVolumeID := "vol_os_123"
 
-	instance := Instance{
+	instance := Instance{ //nolint:gosec // G101: test fixture, not real credentials
 		ID:              instanceID,
 		IP:              &ip,
 		Status:          StatusRunning,
@@ -651,7 +739,7 @@ func (ms *MockServer) handleGetInstance(w http.ResponseWriter, r *http.Request) 
 		Storage:         map[string]interface{}{"description": "100GB SSD"},
 		Hostname:        "test-instance",
 		Description:     "Test instance",
-		Location:        LocationFIN01,
+		Location:        LocationFIN03,
 		PricePerHour:    0.50,
 		IsSpot:          false,
 		InstanceType:    "1V100.6V",
@@ -681,7 +769,7 @@ func (ms *MockServer) handleCreateInstance(w http.ResponseWriter, r *http.Reques
 	// Use LocationCode if provided, otherwise default
 	location := req.LocationCode
 	if location == "" {
-		location = LocationFIN01
+		location = LocationFIN03
 	}
 
 	// Use Contract and Pricing if provided, otherwise use defaults
@@ -698,7 +786,7 @@ func (ms *MockServer) handleCreateInstance(w http.ResponseWriter, r *http.Reques
 	ip := mockIPAddress
 	osVolumeID := "vol_os_new_123"
 
-	instance := Instance{
+	instance := Instance{ //nolint:gosec // G101: test fixture, not real credentials
 		ID:              "inst_new_123",
 		IP:              &ip,
 		Status:          StatusPending,
@@ -736,8 +824,24 @@ func (ms *MockServer) handleInstanceAction(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Mock successful action - API returns 202 Accepted with empty body
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
+
+	type actionResult struct {
+		Action     string `json:"action"`
+		InstanceID string `json:"instanceId"`
+		Status     string `json:"status"`
+	}
+
+	var results []actionResult
+	for _, id := range req.ID {
+		results = append(results, actionResult{
+			Action:     req.Action,
+			InstanceID: id,
+			Status:     "success",
+		})
+	}
+	writeJSON(w, results)
 }
 
 func (ms *MockServer) handleGetBalance(w http.ResponseWriter, _ *http.Request) {
@@ -772,8 +876,8 @@ func (ms *MockServer) handleGetLocations(w http.ResponseWriter, _ *http.Request)
 
 	locations := []Location{
 		{
-			Code:        LocationFIN01,
-			Name:        "Finland 01",
+			Code:        LocationFIN03,
+			Name:        "Finland 03",
 			Country:     "Finland",
 			CountryCode: "FI",
 			Available:   true,
@@ -1012,8 +1116,9 @@ func (ms *MockServer) handleGetVolumeTypes(w http.ResponseWriter, _ *http.Reques
 		{
 			Type: "NVMe",
 			Price: VolumeTypePrice{
-				MonthlyPerGB: 0.12,
-				Currency:     "USD",
+				PricePerMonthPerGB: 0.12,
+				CPSPerGB:           4.5662100456621005e-8,
+				Currency:           "usd",
 			},
 			IsSharedFS:           false,
 			BurstBandwidth:       2000,
@@ -1024,8 +1129,9 @@ func (ms *MockServer) handleGetVolumeTypes(w http.ResponseWriter, _ *http.Reques
 		{
 			Type: "NVMe_Shared",
 			Price: VolumeTypePrice{
-				MonthlyPerGB: 0.15,
-				Currency:     "USD",
+				PricePerMonthPerGB: 0.15,
+				CPSPerGB:           5.707762557077625e-8,
+				Currency:           "usd",
 			},
 			IsSharedFS:           true,
 			BurstBandwidth:       3000,
@@ -1036,8 +1142,9 @@ func (ms *MockServer) handleGetVolumeTypes(w http.ResponseWriter, _ *http.Reques
 		{
 			Type: "HDD",
 			Price: VolumeTypePrice{
-				MonthlyPerGB: 0.05,
-				Currency:     "USD",
+				PricePerMonthPerGB: 0.05,
+				CPSPerGB:           1.902587519025875e-8,
+				Currency:           "usd",
 			},
 			IsSharedFS:           false,
 			BurstBandwidth:       500,
@@ -1069,7 +1176,7 @@ func (ms *MockServer) handleGetClusters(w http.ResponseWriter, _ *http.Request) 
 			GPU:          map[string]interface{}{"description": "8x Tesla V100 16GB", "number_of_gpus": 8},
 			Memory:       map[string]interface{}{"description": "256GB RAM", "size_in_gigabytes": 256},
 			GPUMemory:    map[string]interface{}{"description": "128GB GPU RAM", "size_in_gigabytes": 128},
-			Location:     LocationFIN01,
+			Location:     LocationFIN03,
 			Contract:     "PAY_AS_YOU_GO",
 		},
 	}
@@ -1103,7 +1210,7 @@ func (ms *MockServer) handleGetCluster(w http.ResponseWriter, r *http.Request) {
 		GPU:          map[string]interface{}{"description": "8x Tesla V100 16GB", "number_of_gpus": 8},
 		Memory:       map[string]interface{}{"description": "256GB RAM", "size_in_gigabytes": 256},
 		GPUMemory:    map[string]interface{}{"description": "128GB GPU RAM", "size_in_gigabytes": 128},
-		Location:     LocationFIN01,
+		Location:     LocationFIN03,
 		Contract:     "PAY_AS_YOU_GO",
 	}
 
@@ -1172,7 +1279,7 @@ func (ms *MockServer) handleGetClusterAvailabilities(w http.ResponseWriter, _ *h
 
 	availabilities := []ClusterAvailability{
 		{
-			LocationCode:   LocationFIN01,
+			LocationCode:   LocationFIN03,
 			Availabilities: []string{"8V100.48V", "16H200", "32H200"},
 		},
 	}
@@ -1418,7 +1525,7 @@ func (ms *MockServer) handleGetInstanceAvailabilities(w http.ResponseWriter, _ *
 
 	availabilities := []LocationAvailability{
 		{
-			LocationCode:   LocationFIN01,
+			LocationCode:   LocationFIN03,
 			Availabilities: []string{"1V100.6V", "8V100.48V"},
 		},
 		{
@@ -1677,61 +1784,11 @@ func (ms *MockServer) handleCreateContainerDeployment(w http.ResponseWriter, _ *
 func (ms *MockServer) handleUpdateContainerDeployment(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
-	// Parse request body to validate structure
-	var req map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		writeJSON(w, map[string]string{"error": "invalid JSON"})
+	if !decodeAndValidateNamedContainers(w, r) {
 		return
 	}
 
-	// Validate containers have required name field (like the real API)
-	if containers, ok := req["containers"].([]interface{}); ok && len(containers) > 0 {
-		for i, c := range containers {
-			container, ok := c.(map[string]interface{})
-			if !ok {
-				w.WriteHeader(http.StatusBadRequest)
-				writeJSON(w, map[string]string{"error": "invalid container format"})
-				return
-			}
-			// Check if name is missing or empty
-			name, hasName := container["name"]
-			if !hasName || name == nil || name == "" {
-				w.WriteHeader(http.StatusBadRequest)
-				writeJSON(w, map[string]interface{}{
-					"message": "containers." + string(rune('0'+i)) + ".name should not be null or undefined",
-				})
-				return
-			}
-		}
-	}
-
-	// Return updated deployment response
-	response := `{
-		"name": "test-deployment",
-		"containers": [
-			{
-				"name": "updated-container",
-				"image": {
-					"image": "nginx:latest",
-					"last_updated_at": "2024-01-01T00:00:00.000Z"
-				},
-				"exposed_port": 8080
-			}
-		],
-		"endpoint_base_url": "https://containers.datacrunch.io/test-deployment",
-		"created_at": "2024-01-01T00:00:00.000Z",
-		"compute": {
-			"name": "H100",
-			"size": 1
-		},
-		"container_registry_settings": {
-			"is_private": false
-		},
-		"is_spot": false
-	}`
-
-	writeBytes(w, []byte(response))
+	writeBytes(w, []byte(mockUpdatedContainerDeploymentResponse))
 }
 
 func (ms *MockServer) handleGetDeploymentScaling(w http.ResponseWriter, _ *http.Request) {
@@ -2095,6 +2152,16 @@ func (ms *MockServer) handleCreateJobDeployment(w http.ResponseWriter, r *http.R
 	writeBytes(w, []byte(response))
 }
 
+func (ms *MockServer) handleUpdateJobDeployment(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	if !decodeAndValidateNamedContainers(w, r) {
+		return
+	}
+
+	writeBytes(w, []byte(mockUpdatedJobDeploymentResponse))
+}
+
 func (ms *MockServer) handleGetJobDeploymentScaling(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	// Return same response as container deployment scaling (ScalingOptions)
@@ -2174,6 +2241,37 @@ func writeBytes(w http.ResponseWriter, data []byte) {
 	if _, err := w.Write(data); err != nil {
 		log.Printf("mock server: failed to write response: %v", err)
 	}
+}
+
+func decodeAndValidateNamedContainers(w http.ResponseWriter, r *http.Request) bool {
+	var req map[string]interface{}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]string{"error": "invalid JSON"})
+		return false
+	}
+
+	if containers, ok := req["containers"].([]interface{}); ok && len(containers) > 0 {
+		for i, c := range containers {
+			container, ok := c.(map[string]interface{})
+			if !ok {
+				w.WriteHeader(http.StatusBadRequest)
+				writeJSON(w, map[string]string{"error": "invalid container format"})
+				return false
+			}
+
+			name, hasName := container["name"]
+			if !hasName || name == nil || name == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				writeJSON(w, map[string]interface{}{
+					"message": "containers." + string(rune('0'+i)) + ".name should not be null or undefined",
+				})
+				return false
+			}
+		}
+	}
+
+	return true
 }
 
 // ErrorResponse creates a mock error response

@@ -7,7 +7,18 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
+
+	validation "github.com/go-ozzo/ozzo-validation/v4"
 )
+
+// StartupScript represents a startup script
+type StartupScript struct {
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	Script    string    `json:"script"`
+	CreatedAt time.Time `json:"created_at"`
+}
 
 type StartupScriptService struct {
 	client *Client
@@ -20,6 +31,14 @@ type CreateStartupScriptRequest struct {
 
 type DeleteMultipleStartupScriptsRequest struct {
 	Scripts []string `json:"scripts"`
+}
+
+// Validate validates the CreateStartupScriptRequest fields
+func (r CreateStartupScriptRequest) Validate() error {
+	return validation.ValidateStruct(&r,
+		validation.Field(&r.Name, validation.Required),
+		validation.Field(&r.Script, validation.Required),
+	)
 }
 
 func (s *StartupScriptService) GetAllStartupScripts(ctx context.Context) ([]StartupScript, error) {
@@ -48,6 +67,9 @@ func (s *StartupScriptService) GetStartupScriptByID(ctx context.Context, scriptI
 
 // AddStartupScript creates a script and refetches it since the API returns only the ID as plain text
 func (s *StartupScriptService) AddStartupScript(ctx context.Context, req *CreateStartupScriptRequest) (*StartupScript, error) {
+	if err := req.Validate(); err != nil {
+		return nil, err
+	}
 	return s.createWithPlainTextResponse(ctx, req)
 }
 

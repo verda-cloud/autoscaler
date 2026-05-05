@@ -44,7 +44,10 @@ func (s *ContainerDeploymentsService) GetDeploymentsForProject(ctx context.Conte
 }
 
 func (s *ContainerDeploymentsService) CreateDeployment(ctx context.Context, req *CreateDeploymentRequest) (*ContainerDeployment, error) {
-	if err := validateCreateDeploymentRequest(req); err != nil {
+	if req == nil {
+		return nil, fmt.Errorf("request cannot be nil")
+	}
+	if err := req.Validate(); err != nil {
 		return nil, err
 	}
 
@@ -53,57 +56,6 @@ func (s *ContainerDeploymentsService) CreateDeployment(ctx context.Context, req 
 		return nil, err
 	}
 	return &deployment, nil
-}
-
-// validateCreateDeploymentRequest validates all required fields for container deployment creation
-func validateCreateDeploymentRequest(req *CreateDeploymentRequest) error {
-	if req == nil {
-		return fmt.Errorf("request cannot be nil")
-	}
-
-	// Basic required fields
-	if req.Name == "" {
-		return fmt.Errorf("name is required")
-	}
-	if req.Compute.Name == "" {
-		return fmt.Errorf("compute.name is required")
-	}
-
-	// Container validation
-	if len(req.Containers) == 0 {
-		return fmt.Errorf("at least one container is required")
-	}
-	for i, c := range req.Containers {
-		if c.Image == "" {
-			return fmt.Errorf("containers[%d].image is required", i)
-		}
-		// Check for "latest" tag - API does not allow it
-		if isLatestTag(c.Image) {
-			return fmt.Errorf("containers[%d].image: 'latest' tag is not allowed, please specify a specific version tag (e.g., nginx:1.25.3)", i)
-		}
-		if c.ExposedPort == 0 {
-			return fmt.Errorf("containers[%d].exposed_port is required", i)
-		}
-	}
-
-	// Scaling validation
-	if req.Scaling.MaxReplicaCount == 0 {
-		return fmt.Errorf("scaling.max_replica_count is required")
-	}
-	if req.Scaling.ScaleDownPolicy == nil {
-		return fmt.Errorf("scaling.scale_down_policy is required")
-	}
-	if req.Scaling.ScaleUpPolicy == nil {
-		return fmt.Errorf("scaling.scale_up_policy is required")
-	}
-	if req.Scaling.ScalingTriggers == nil {
-		return fmt.Errorf("scaling.scaling_triggers is required")
-	}
-	if req.Scaling.ScalingTriggers.QueueLoad != nil && req.Scaling.ScalingTriggers.QueueLoad.Threshold < 1 {
-		return fmt.Errorf("scaling.scaling_triggers.queue_load.threshold must be >= 1")
-	}
-
-	return nil
 }
 
 func (s *ContainerDeploymentsService) GetDeploymentByName(ctx context.Context, deploymentName string) (*ContainerDeployment, error) {
@@ -116,15 +68,12 @@ func (s *ContainerDeploymentsService) GetDeploymentByName(ctx context.Context, d
 }
 
 func (s *ContainerDeploymentsService) UpdateDeployment(ctx context.Context, deploymentName string, req *UpdateDeploymentRequest) (*ContainerDeployment, error) {
-	// Validate required fields for update
 	if req == nil {
 		return nil, fmt.Errorf("request cannot be nil")
 	}
 	if deploymentName == "" {
 		return nil, fmt.Errorf("deploymentName is required")
 	}
-	// Note: UpdateDeployment is a PATCH operation, so partial updates are allowed.
-	// Containers are optional - you can update just scaling, compute, or other fields.
 
 	path := fmt.Sprintf("/container-deployments/%s", deploymentName)
 	deployment, _, err := patchRequest[ContainerDeployment](ctx, s.client, path, req)
@@ -147,21 +96,15 @@ func (s *ContainerDeploymentsService) DeleteDeployment(ctx context.Context, depl
 
 	path := fmt.Sprintf("/container-deployments/%s", deploymentName)
 
-	// Handle timeout parameter based on API specification
-	// - Negative values: omit timeout parameter (API uses default 60000ms)
-	// - 0: skip waiting (return immediately)
-	// - 1-300000: explicit timeout value
-	// - >300000: cap at maximum 300000ms
 	if timeoutMs >= 0 {
 		timeout := timeoutMs
 		if timeout > 300000 {
-			timeout = 300000 // cap at max 300 seconds
+			timeout = 300000
 		}
 		params := url.Values{}
 		params.Set("timeout", fmt.Sprintf("%d", timeout))
 		path += "?" + params.Encode()
 	}
-	// If timeoutMs < 0, don't add timeout parameter (use API default)
 
 	_, err := deleteRequestAllowEmptyResponse(ctx, s.client, path)
 	return err
@@ -319,6 +262,12 @@ func (s *ContainerDeploymentsService) GetSecrets(ctx context.Context) ([]Secret,
 }
 
 func (s *ContainerDeploymentsService) CreateSecret(ctx context.Context, req *CreateSecretRequest) error {
+	if req == nil {
+		return fmt.Errorf("request cannot be nil")
+	}
+	if err := req.Validate(); err != nil {
+		return err
+	}
 	_, _, err := postRequest[interface{}](ctx, s.client, "/secrets", req)
 	return err
 }
@@ -349,11 +298,8 @@ func (s *ContainerDeploymentsService) CreateFileSecret(ctx context.Context, req 
 	if req == nil {
 		return fmt.Errorf("request cannot be nil")
 	}
-	if req.Name == "" {
-		return fmt.Errorf("name is required")
-	}
-	if len(req.Files) == 0 {
-		return fmt.Errorf("files map cannot be empty")
+	if err := req.Validate(); err != nil {
+		return err
 	}
 	_, _, err := postRequest[interface{}](ctx, s.client, "/file-secrets", req)
 	return err
@@ -384,11 +330,8 @@ func (s *ContainerDeploymentsService) CreateRegistryCredentials(ctx context.Cont
 	if req == nil {
 		return fmt.Errorf("request cannot be nil")
 	}
-	if req.Name == "" {
-		return fmt.Errorf("name is required")
-	}
-	if req.Type == "" {
-		return fmt.Errorf("type is required")
+	if err := req.Validate(); err != nil {
+		return err
 	}
 	_, _, err := postRequest[interface{}](ctx, s.client, "/container-registry-credentials", req)
 	return err

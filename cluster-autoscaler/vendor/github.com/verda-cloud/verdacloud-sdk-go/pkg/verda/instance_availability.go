@@ -6,6 +6,18 @@ import (
 	"net/url"
 )
 
+// InstanceAvailability represents instance availability information
+type InstanceAvailability struct {
+	LocationCode   string   `json:"location_code"`
+	Availabilities []string `json:"availabilities"`
+}
+
+// LocationAvailability represents instance type availability by location code
+type LocationAvailability struct {
+	LocationCode   string   `json:"location_code"`
+	Availabilities []string `json:"availabilities"`
+}
+
 type InstanceAvailabilityService struct {
 	client *Client
 }

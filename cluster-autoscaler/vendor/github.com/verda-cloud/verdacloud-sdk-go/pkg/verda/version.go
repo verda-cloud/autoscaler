@@ -7,7 +7,7 @@ import (
 
 const (
 	// fallbackVersion is used when build info is not available (e.g., during development)
-	fallbackVersion = "1.2.1"
+	fallbackVersion = "1.4.2"
 
 	// sdkName is the identifier for this SDK
 	sdkName = "verdacloud-sdk-go"
@@ -41,10 +41,34 @@ func DefaultUserAgent() string {
 // BuildUserAgent constructs the full User-Agent string.
 // If customUA is provided, it prepends it to the SDK's default User-Agent.
 // If customUA is empty, it returns just the SDK's default User-Agent.
+// The custom User-Agent is sanitized to remove control characters and capped at 256 characters.
 func BuildUserAgent(customUA string) string {
 	defaultUA := DefaultUserAgent()
 	if customUA == "" {
 		return defaultUA
 	}
-	return customUA + " " + defaultUA
+	sanitized := sanitizeUserAgent(customUA)
+	if sanitized == "" {
+		return defaultUA
+	}
+	return sanitized + " " + defaultUA
+}
+
+const maxUserAgentLen = 256
+
+// sanitizeUserAgent strips control characters and caps length to prevent
+// header injection, log pollution, and downstream parsing issues.
+func sanitizeUserAgent(ua string) string {
+	var b strings.Builder
+	b.Grow(len(ua))
+	for _, r := range ua {
+		if r >= 0x20 && r != 0x7F {
+			b.WriteRune(r)
+		}
+	}
+	result := strings.TrimSpace(b.String())
+	if len(result) > maxUserAgentLen {
+		result = result[:maxUserAgentLen]
+	}
+	return result
 }

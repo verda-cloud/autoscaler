@@ -29,8 +29,12 @@ func (s *ClusterService) GetByID(ctx context.Context, id string) (*Cluster, erro
 }
 
 func (s *ClusterService) Create(ctx context.Context, req CreateClusterRequest) (*CreateClusterResponse, error) {
+	if err := req.Validate(); err != nil {
+		return nil, err
+	}
+
 	if req.LocationCode == "" {
-		req.LocationCode = LocationFIN01
+		req.LocationCode = LocationFIN03
 	}
 
 	response, _, err := postRequest[CreateClusterResponse](ctx, s.client, "/clusters", req)
