@@ -25,14 +25,16 @@ import (
 	"math/rand"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/verda-cloud/verdacloud-sdk-go/pkg/verda"
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
-	"github.com/verda-cloud/verdacloud-sdk-go/pkg/verda"
 	kube_client "k8s.io/client-go/kubernetes"
+	klog "k8s.io/klog/v2"
 )
 
 const (
@@ -48,7 +50,10 @@ type VerdacloudManager struct {
 	dcService   dcService
 	asgs        *autoScalingGroups
 	kubeClient  kube_client.Interface
-	lastRefresh time.Time
+
+	// Unix-nano timestamp of the last successful regenerate.
+	// Atomic keeps concurrent Refresh calls race-free.
+	lastRefreshNanos atomic.Int64
 }
 
 type asgTemplate struct {
@@ -80,13 +85,11 @@ func createVerdacloudManager(cloudReader io.Reader, discoveryOpts cloudprovider.
 
 	cfg = verifyCloudConfigAndPatch(cfg)
 
-	// create the sdk provider
 	sdkProvider, err := createVerdacloudSDKProvider(cfg)
 	if err != nil {
 		return nil, err
 	}
 
-	// create the verdacloud wrapper using the official SDK client
 	dcService := newVerdacloudWrapper(sdkProvider.client)
 
 	manager := &VerdacloudManager{
@@ -107,7 +110,8 @@ func createVerdacloudManager(cloudReader io.Reader, discoveryOpts cloudprovider.
 
 // Refresh refreshes the state of the manager from the cloud provider.
 func (m *VerdacloudManager) Refresh() error {
-	if m.lastRefresh.Add(refreshInterval).After(time.Now()) {
+	last := time.Unix(0, m.lastRefreshNanos.Load())
+	if last.Add(refreshInterval).After(time.Now()) {
 		return nil
 	}
 	return m.forceRefresh()
@@ -117,7 +121,7 @@ func (m *VerdacloudManager) forceRefresh() error {
 	if err := m.asgs.regenerate(); err != nil {
 		return err
 	}
-	m.lastRefresh = time.Now()
+	m.lastRefreshNanos.Store(time.Now().UnixNano())
 	return nil
 }
 
@@ -178,10 +182,12 @@ func (m *VerdacloudManager) DeleteInstances(instanceRefs []InstanceRef) error {
 
 	var wg sync.WaitGroup
 	errsCh := make(chan error, len(instanceRefs))
+	sem := make(chan struct{}, MAX_CONCURRENT_INSTANCE_CREATIONS)
 	for _, ref := range instanceRefs {
 		wg.Add(1)
+		sem <- struct{}{}
 		go func(r InstanceRef) {
-			defer wg.Done()
+			defer func() { <-sem; wg.Done() }()
 			if err := m.asgs.DeleteInstance(r); err != nil {
 				errsCh <- err
 			}
@@ -232,6 +238,7 @@ func (m *VerdacloudManager) GetAvailableGPUTypes() map[string]struct{} {
 	ctx := context.Background()
 	instanceTypes, err := m.dcService.ListInstanceTypes(ctx)
 	if err != nil {
+		klog.Warningf("GetAvailableGPUTypes: list instance types failed: %v", err)
 		return nil
 	}
 
@@ -293,11 +300,11 @@ func (m *VerdacloudManager) buildNodeFromTemplate(asg *Asg, template *asgTemplat
 		"kubernetes.io/arch":               template.InstanceType.Arch,
 		"kubernetes.io/os":                 "linux",
 		"node.kubernetes.io/instance-type": template.InstanceType.InstanceType,
-		// Multi-location value is intentional: ASG instances are provisioned by trying
-		// locations in order until one succeeds, providing availability fallback.
+		// Template-only fallback label; real node labels cannot contain commas.
+		// Single-location nodeSelectors will not match this simulated node.
 		"topology.kubernetes.io/location": strings.Join(asg.AvailabilityLocations, ","),
-		"verda.com/hostname":               asg.Name,
-		NodeGroupLabelKey:                  asg.Name,
+		"verda.com/hostname":              asg.Name,
+		NodeGroupLabelKey:                 asg.Name,
 	}
 	if template.InstanceType.GPU > 0 {
 		labels[AcceleratorLabel] = template.InstanceType.InstanceType

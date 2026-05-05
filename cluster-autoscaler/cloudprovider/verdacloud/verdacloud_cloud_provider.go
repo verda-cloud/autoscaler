@@ -80,6 +80,7 @@ func (d *VerdacloudCloudProvider) NodeGroups() []cloudprovider.NodeGroup {
 func (d *VerdacloudCloudProvider) NodeGroupForNode(node *apiv1.Node) (cloudprovider.NodeGroup, error) {
 	instanceRef, err := instanceRefFromProviderId(node.Spec.ProviderID)
 	if err != nil {
+		klog.V(4).Infof("NodeGroupForNode: skipping node %s with non-VerdaCloud providerID %q: %v", node.Name, node.Spec.ProviderID, err)
 		return nil, nil
 	}
 
@@ -98,6 +99,7 @@ func (d *VerdacloudCloudProvider) NodeGroupForNode(node *apiv1.Node) (cloudprovi
 func (d *VerdacloudCloudProvider) HasInstance(node *apiv1.Node) (bool, error) {
 	instanceRef, err := instanceRefFromProviderId(node.Spec.ProviderID)
 	if err != nil {
+		klog.V(4).Infof("HasInstance: skipping node %s with non-VerdaCloud providerID %q: %v", node.Name, node.Spec.ProviderID, err)
 		return false, nil
 	}
 
@@ -147,8 +149,8 @@ func (d *VerdacloudCloudProvider) GetNodeGpuConfig(node *apiv1.Node) *cloudprovi
 	gpuAllocatable, hasGpuAllocatable := node.Status.Allocatable[ResourceNvidiaGPU]
 	if hasGpuLabel || (hasGpuAllocatable && !gpuAllocatable.IsZero()) {
 		return &cloudprovider.GpuConfig{
-			Label:                gpuLabel,
-			Type:                 node.Labels[gpuLabel],
+			Label:        gpuLabel,
+			Type:         node.Labels[gpuLabel],
 			ResourceName: ResourceNvidiaGPU,
 		}
 	}
@@ -156,6 +158,11 @@ func (d *VerdacloudCloudProvider) GetNodeGpuConfig(node *apiv1.Node) *cloudprovi
 }
 
 // Cleanup cleans up the cloud provider.
+//
+// Currently a no-op: the SDK client wraps an http.Client and holds no
+// long-lived resources, and the provider runs no background goroutines.
+// If either of those changes (e.g. background pollers, persistent
+// connections, file descriptors), this method must signal them to stop.
 func (d *VerdacloudCloudProvider) Cleanup() error {
 	return nil
 }

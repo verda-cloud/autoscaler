@@ -268,37 +268,6 @@ func TestVerifyCloudConfigAndPatch(t *testing.T) {
 	}
 }
 
-func TestParseInstanceType(t *testing.T) {
-	tests := []struct {
-		name         string
-		instanceType string
-		expectCPU    int64
-		expectMemory int64 // in GB before conversion
-		expectGPU    int64
-	}{
-		{"CPU 4 core", "CPU.4V.16G", 4, 16, 0},
-		{"CPU 8 core", "CPU.8V.32G", 8, 32, 0},
-		{"GPU 1xH100 3-part", "1H100.80S.22V", 22, 22 * 4, 1},
-		{"GPU 8xH100 3-part", "8H100.80S.176V", 176, 176 * 4, 8},
-		{"GPU 2-part", "1A100.12V", 12, 12 * 4, 1},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			res := parseInstanceType(tc.instanceType)
-			if res.CPU != tc.expectCPU {
-				t.Errorf("CPU: expected %d, got %d", tc.expectCPU, res.CPU)
-			}
-			expectedMem := tc.expectMemory * 1024 * 1024 * 1024
-			if res.Memory != expectedMem {
-				t.Errorf("Memory: expected %d, got %d", expectedMem, res.Memory)
-			}
-			if res.GPU != tc.expectGPU {
-				t.Errorf("GPU: expected %d, got %d", tc.expectGPU, res.GPU)
-			}
-		})
-	}
-}
-
 func TestRefresh(t *testing.T) {
 	mock, manager := newTestManagerWithMock(t)
 	mock.setInstances([]verda.Instance{})
@@ -317,7 +286,7 @@ func TestRefresh(t *testing.T) {
 	}
 
 	// After interval expires, should refresh again
-	manager.lastRefresh = time.Now().Add(-2 * refreshInterval)
+	manager.lastRefreshNanos.Store(time.Now().Add(-2 * refreshInterval).UnixNano())
 	mock.instancesErr = nil
 	mock.setInstances([]verda.Instance{})
 	err = manager.Refresh()

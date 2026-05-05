@@ -10,6 +10,8 @@ The cluster autoscaler for VerdaCloud (formerly DataCrunch.io) scales worker nod
 
 `VERDA_BASE_URL` Optional VerdaCloud API base URL. Defaults to `https://api.verda.com/v1`.
 
+`VERDA_DEBUG` Optional. Set to `true` or `1` to enable SDK-level detailed logging (request/response traces from the verdacloud SDK). Independent of the `debug` field in the JSON config — either one enables verbose SDK logging.
+
 `VERDA_CLUSTER_CONFIG` Base64 encoded JSON according to the following structure:
 
 ```json
@@ -61,9 +63,9 @@ The JSON above is the authoritative format. This table summarizes top‑level ke
 | image.gpu | string | required | — | Image for GPU nodes provided by VerdaCloud (current: k8s 1.31.1, cuda 12.9). Contact us for other versions. |
 | image.cpu | string | required | — | Image for CPU nodes provided by VerdaCloud (current: k8s 1.31.1, cuda 12.9). Contact us for other versions. |
 | sshKeyIDs | array<string> | required | — | SSH key IDs to inject. See [Fetching SSH Keys](#fetching-ssh-keys) for details. |
-| billingConfig.price | string | required | — | Must be `FIXED_PRICE`. |
-| billingConfig.contract | string | optional | — | One of LONG_TERM, PAY_AS_YOU_GO, or SPOT |
-| debug | bool | optional | false | Enables additional provider‑side diagnostics |
+| billingConfig.price | string | optional | `FIXED_PRICE` | Pricing mode. Currently only `FIXED_PRICE` is supported by the API; left empty, the provider sets it to that default. |
+| billingConfig.contract | string | optional | `PAY_AS_YOU_GO` | One of `LONG_TERM`, `PAY_AS_YOU_GO`, or `SPOT`. Empty defaults to `PAY_AS_YOU_GO`. |
+| debug | bool | optional | false | Enables verbose logging from the verdacloud SDK (request/response traces). Equivalent to setting `VERDA_DEBUG=true` as an environment variable. |
 | availableLocations | array<string> | required | — | Location codes eligible for provisioning. Group config overwrites global. |
 | osVolumeSize | int | optional | 50 | Size of the OS volume in GB. Group config overwrites global. |
 | labels | array<string> | optional | — | Labels to apply to all nodes. Group config merges with global. |
@@ -71,15 +73,18 @@ The JSON above is the authoritative format. This table summarizes top‑level ke
 | startupScriptEnv | map<string,string> | required | — | Environment variables for the startup script. Must align with `startupScript`. |
 | taints | array<object> | optional | — | Standard k8s taint objects applied to nodes |
 | groups | map<string,object> | optional | — | Node group definitions overriding defaults. See below for supported keys. |
+| reapOrphanNodes | bool | optional | false | Opt-in: when true, the autoscaler deletes K8s `Node` objects whose VerdaCloud VMs have disappeared from the API. Intended only for clusters that **do not** run a verdacloud cloud-controller-manager. Once a CCM is deployed it owns Node lifecycle and this flag should remain off. See [Orphan-node reaping](#orphan-node-reaping) below. |
+| reapOrphanNodesAfterCycles | int | optional | 3 | Number of consecutive `Refresh` cycles a hostname must be absent from the VerdaCloud API before its `Node` is deleted. Guards against deleting healthy Nodes on a single bad API response. Only consulted when `reapOrphanNodes` is true. |
 
 ### Group Configuration Overrides
 The `groups` map allows defining overrides for specific Auto Scaling Groups (ASGs). The format is `"asg-name": { ... }`.
 Supported override keys within a group object:
 - `labels`: Merges with global labels. Overwrites value if conflict with global label.
-- `taints`: Merges with global group. Overwrites value if conflict with global.
+- `taints`: Merges with global taints. Overwrites value if conflict with global.
 - `availableLocations`: Overwrites global available locations.
 - `billingConfig`: Overwrites global billing config.
-- `osVolumeSize`: Overwrites global OS volume size.
+- `osVolumeSize`: Overwrites global OS volume size. Below 50GB falls back to the global value (or default 50).
+- `additionalVolumes`: Per-ASG list of extra volumes (`name`, `size`, `type`) attached on instance creation. Group-only; there is no global equivalent.
 
 
 `VERDA_CLUSTER_CONFIG_FILE` Can be used as alternative to `VERDA_CLUSTER_CONFIG`. This is the path to a file containing the JSON structure described above. The file will be read and the contents will be used as the configuration.
@@ -131,7 +136,7 @@ Multiple flags will create multiple node pools. For example:
 --nodes=1:5:1A100.22V:as-test-1a10022v:custom-node
 ```
 
-The last example uses a custom hostname prefix `custom-node`, so instances will be named like `custom-node-vm-fin-03-42` instead of `as-test-1a10022v-vm-fin-03-42`.
+The last example uses a custom hostname prefix `custom-node`, so instances will be named like `custom-node-vm-fin-03-1a2b3c4d` instead of `as-test-1a10022v-vm-fin-03-1a2b3c4d`. The `1a2b3c4d` suffix is an 8-character lowercase hex value derived from a random `uint32`.
 
 You can find a complete deployment sample under [examples/cluster-autoscaler-deployment-example.yaml](examples/cluster-autoscaler-deployment-example.yaml). This single file contains all required Kubernetes resources including namespace, RBAC, secrets, configmap, and deployment. Please be aware that you should change the values within this deployment to reflect your cluster:
 
@@ -159,13 +164,49 @@ make push-image BUILD_TAGS=verdacloud TAG='dev' REGISTRY='verdacloud'
 
 **Note:** The `make-image` command automatically builds the code inside Docker, so no separate build step is needed.
 
+## Orphan-node reaping
+
+`reapOrphanNodes` is an opt-in transitional feature for clusters that do not
+yet run a verdacloud cloud-controller-manager (CCM). Without a CCM, when a
+VerdaCloud VM is deleted (manually, by the autoscaler, or by VerdaCloud)
+nothing removes the corresponding Kubernetes `Node` object — orphan Nodes
+linger as `NotReady` forever.
+
+When `reapOrphanNodes` is `true`, on each `Refresh` the autoscaler:
+
+1. Lists Nodes whose `providerID` has the `verdacloud://` prefix.
+2. Filters to hostnames whose prefix matches one of the registered ASGs
+   (so manually-provisioned VerdaCloud VMs such as control-plane nodes
+   are never touched).
+3. For each remaining Node whose hostname is absent from the latest VerdaCloud
+   API response, increments a per-hostname missing-cycle counter.
+4. Deletes the Node only after the counter reaches
+   `reapOrphanNodesAfterCycles` (default `3`). The counter resets when the
+   hostname reappears in a later API response.
+
+This avoids deleting healthy Nodes on a single bad API response (e.g. a
+truncated paginated list). With the default cycle count and a 1-minute
+refresh interval, deletion happens roughly 3 minutes after a VM goes missing.
+
+When this flag is enabled, the cluster-autoscaler ServiceAccount must have
+`delete` permission on `nodes`. The example deployment manifest grants this
+permission unconditionally; if you keep `reapOrphanNodes: false`, you may
+remove the `delete` verb from the `nodes` ClusterRole rule for least privilege.
+
+**Recommendation**: deploy a verdacloud CCM
+(`verdacloud-cloud-controller-manager`) and leave `reapOrphanNodes` at its
+default `false`. The CCM owns Node lifecycle by design, follows Kubernetes
+conventions, and doesn't require the autoscaler to hold `nodes/delete`.
+
 ## Support and caveats
 
-- Hostname format: Instances created by this provider include an internal magic separator in their hostname that encodes the ASG name or custom hostname prefix (format: `{hostname-prefix|asg-name}-vm-{location-lowercase}-{random-2-digits}`). The autoscaler relies on this to identify group membership. Examples: `custom-node-vm-fin-03-42` or `as-test-1a100-vm-fin-03-87`.
+- Hostname format: Instances created by this provider include an internal magic separator (`-vm-`) in their hostname that encodes the ASG name or custom hostname prefix (format: `{hostname-prefix|asg-name}-vm-{location-lowercase}-{8-char-hex}`). The 8-character hex suffix is `fmt.Sprintf("%08x", rand.Uint32())`. The autoscaler relies on this magic separator to identify group membership. Examples: `custom-node-vm-fin-03-1a2b3c4d` or `as-test-1a100-vm-fin-03-deadbeef`.
 - No legacy fallback: If instances are created outside this provider with different hostname conventions, they may not be associated with the expected ASG by the autoscaler.
 - ProviderID format: `verdacloud://<location>/<hostname>`.
 
 ## Debugging
 
-To enable debug logging, run the autoscaler with `--v=4` or higher.
-At `--v=7` the autoscaler logs CreateInstance request bodies for troubleshooting; response bodies and headers are not logged.
+Two independent log channels:
+
+- **Cluster-autoscaler verbosity (`--v=N`)** — controls the standard `klog` output from this provider. The provider logs at `--v=4` (informational, e.g. ASG registration, scale-up/down decisions, sweep cycle counts) and `--v=5` (per-instance availability checks). Higher levels (`--v=6+`) emit more detail from the cluster-autoscaler core but no additional provider-specific output.
+- **VerdaCloud SDK detailed logging** — enabled by setting either the `debug` field in the JSON config to `true`, or the `VERDA_DEBUG` env var to `true`/`1`. This causes the SDK to log full HTTP request/response traces, useful for API-level troubleshooting. Disabled by default.

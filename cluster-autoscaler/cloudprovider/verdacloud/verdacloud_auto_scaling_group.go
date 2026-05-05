@@ -40,6 +40,13 @@ type Asg struct {
 	AvailabilityLocations []string
 
 	scaleMutex sync.Mutex
+	// targetSizeMutex serializes DeleteNodes and DecreaseTargetSize per-ASG
+	// to keep concurrent target-size decreases from breaching minSize.
+	//
+	// Lock ordering: when both targetSizeMutex and the manager's cacheMutex
+	// are needed, take targetSizeMutex first (outer, per-ASG) then cacheMutex
+	// (inner, manager-wide). Inverting this order will deadlock.
+	targetSizeMutex sync.Mutex
 }
 
 // AsgRef is a reference to an Auto Scaling Group by name.
@@ -109,11 +116,11 @@ func (ng *VerdacloudNodeGroup) Belongs(node *apiv1.Node) (bool, error) {
 	return targetAsg.Name == ng.asg.Name, nil
 }
 
-// DeleteNodes deletes the specified nodes from the node group.
-// Part of cloudprovider.NodeGroup interface — called from CA's background
-// deletion goroutines. Validates minSize and membership before delegating
-// to DeleteInstances for parallel API deletion + cache cleanup.
+// DeleteNodes safely removes given nodes while holding targetSizeMutex to protect minSize.
 func (ng *VerdacloudNodeGroup) DeleteNodes(nodes []*apiv1.Node) error {
+	ng.asg.targetSizeMutex.Lock()
+	defer ng.asg.targetSizeMutex.Unlock()
+
 	ng.manager.asgs.cacheMutex.RLock()
 	currentSize := ng.asg.curSize
 	minSize := ng.asg.minSize
@@ -147,25 +154,29 @@ func (ng *VerdacloudNodeGroup) ForceDeleteNodes(nodes []*apiv1.Node) error {
 	return cloudprovider.ErrNotImplemented
 }
 
-// DecreaseTargetSize decreases the target size of the node group.
-// This only reduces the in-memory target counter (curSize) to correct for
-// unfulfilled capacity (e.g. instances that failed to register as nodes).
-// It must NOT delete any existing nodes — actual deletions happen in DeleteNodes.
+// DecreaseTargetSize adjusts curSize for unprovisioned capacity (see: DeleteNodes for VM removal).
+// Both use targetSizeMutex: link to design notes in comments above ASG struct.
 func (ng *VerdacloudNodeGroup) DecreaseTargetSize(delta int) error {
 	if delta >= 0 {
 		return fmt.Errorf("size decrease must be negative")
 	}
 
-	targetSize, _ := ng.TargetSize()
-	newTarget := targetSize + delta
-	if newTarget < ng.MinSize() {
+	ng.asg.targetSizeMutex.Lock()
+	defer ng.asg.targetSizeMutex.Unlock()
+
+	ng.manager.asgs.cacheMutex.Lock()
+	defer ng.manager.asgs.cacheMutex.Unlock()
+
+	currentSize := ng.asg.curSize
+	newTarget := currentSize + delta
+	if newTarget < ng.asg.minSize {
 		return fmt.Errorf("attempt to decrease target to %d, but min size is %d for ASG %s",
-			newTarget, ng.MinSize(), ng.asg.Name)
+			newTarget, ng.asg.minSize, ng.asg.Name)
 	}
 
 	klog.V(4).Infof("DecreaseTargetSize ASG %s: %d -> %d",
-		ng.asg.Name, targetSize, newTarget)
-	ng.manager.asgs.adjustTargetSize(ng.asg, delta)
+		ng.asg.Name, currentSize, newTarget)
+	ng.asg.curSize += delta
 	return nil
 }
 
@@ -186,8 +197,7 @@ func (ng *VerdacloudNodeGroup) Nodes() ([]cloudprovider.Instance, error) {
 func (ng *VerdacloudNodeGroup) TemplateNodeInfo() (*schedulerframework.NodeInfo, error) {
 	ctx := context.Background()
 	klog.V(4).Infof("TemplateNodeInfo called for ASG %s", ng.asg.Name)
-	asgRef := AsgRef{Name: ng.asg.Name}
-	template, err := ng.manager.getAsgTemplate(ctx, asgRef)
+	template, err := ng.manager.getAsgTemplate(ctx, ng.asg.AsgRef)
 	if err != nil {
 		klog.Errorf("Failed to get template for ASG %s: %v", ng.asg.Name, err)
 		return nil, err
@@ -211,10 +221,9 @@ func (ng *VerdacloudNodeGroup) Exist() bool {
 	if ng.asg == nil {
 		return false
 	}
-	asgRef := AsgRef{Name: ng.asg.Name}
-	asg, err := ng.manager.GetAsgByRef(asgRef)
+	asg, err := ng.manager.GetAsgByRef(ng.asg.AsgRef)
 	if err != nil {
-		klog.V(4).Infof("Error getting ASG by ref %s: %v", asgRef.Name, err)
+		klog.V(4).Infof("Error getting ASG by ref %s: %v", ng.asg.Name, err)
 		return false
 	}
 	return asg != nil
