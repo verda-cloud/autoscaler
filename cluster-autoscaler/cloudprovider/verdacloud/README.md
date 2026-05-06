@@ -134,64 +134,54 @@ The last example uses a custom hostname prefix `custom-node`, so instances will 
 You can find a complete deployment sample under [examples/cluster-autoscaler-deployment-example.yaml](examples/cluster-autoscaler-deployment-example.yaml). This single file contains all required Kubernetes resources including namespace, RBAC, secrets, configmap, and deployment. Please be aware that you should change the values within this deployment to reflect your cluster:
 
 - Replace `your-client-id` and `your-client-secret` in the `verdacloud-credentials` Secret
-- Set `MASTER_IP`, `MASTER_PORT`, `JOIN_TOKEN`, and `JOIN_HASH_FULL` in the `cluster-autoscaler-startup-env` Secret (see [Cluster join credentials](#cluster-join-credentials) below)
 - Update `your-ssh-key-id` in the ConfigMap
 - Modify the `--nodes` flags to match your desired instance types and scaling limits
-- Update the startup script with your actual base64-encoded cluster join script
+- Update the `startupScript` with your actual base64-encoded cluster join script — including any join credentials your script needs (see [Startup script ownership](#startup-script-ownership) below)
 
-### Cluster join credentials
+### Startup script ownership
 
-`MASTER_IP`, `MASTER_PORT`, `JOIN_TOKEN`, and `JOIN_HASH_FULL` are the
-cluster-join values your operator-owned `startupScript` needs to run
-`kubeadm join`. They live in a Kubernetes `Secret`
-(`cluster-autoscaler-startup-env`), separate from the ConfigMap, so
-`JOIN_TOKEN` and `JOIN_HASH_FULL` never appear in plaintext via
-`kubectl describe configmap` or generic cluster dumps.
-
-The autoscaler container reads them as standard env vars via
-`envFrom: secretRef: cluster-autoscaler-startup-env` on the Deployment.
-Each scale-up, the autoscaler prepends an `export VAR='...'` block to the
-operator's decoded `startupScript` before sending it to Verda's
-`CreateStartupScript` API. The operator's bash references them with normal
-`$VAR` syntax — no template engine, no regex placeholders.
+The autoscaler is a **pure pass-through** for `startupScript`: the bytes
+you put in `cluster-config.json` are decoded and uploaded to Verda's
+`CreateStartupScript` API verbatim before each VM is created. No env-var
+injection, no template rendering, no regex rewriting.
 
 ```text
-K8s Secret (4 keys)         autoscaler container          new VM (cloud-init)
-┌─────────────────────┐     ┌──────────────────┐         ┌──────────────────┐
-│ MASTER_IP=...       │ ──► │ envFrom maps to  │ ──prepend export ─►        │
-│ MASTER_PORT=...     │     │ env vars on the  │  block of `export VAR=...` │
-│ JOIN_TOKEN=...      │     │ autoscaler proc  │  in front of operator body │
-│ JOIN_HASH_FULL=...  │     └──────────────────┘  ───►  CreateStartupScript │
-└─────────────────────┘                                                     │
-                                                          bash sees:        │
-                                                            $MASTER_IP      │
-                                                            $JOIN_TOKEN     │
-                                                            $PROVIDER_ID    │
-                                                            (and runs)      │
-                                                          └─────────────────┘
+cluster-config.json (your bytes)  ─►  Verda CreateStartupScript API
+                                     │
+                                     ▼
+                       Verda provisioner injects bytes into VM cloud-init
+                                     │
+                                     ▼
+                                  VM runs your script verbatim
 ```
 
-The autoscaler also injects two **per-VM** values (`PROVIDER_ID`, `LABELS`)
-computed at scale-up time. They join the same prepended block.
+This means anything your script needs — `MASTER_IP`, `JOIN_TOKEN`,
+`JOIN_HASH_FULL`, etc. — must come from somewhere **you** control. Common
+patterns:
 
-To rotate `JOIN_TOKEN` / `JOIN_HASH_FULL`:
+- **Hardcode in the script body** (simplest; values are visible in this
+  ConfigMap and to anyone who can call Verda's `GetStartupScript` API).
+  Suitable for dev/test or short-lived clusters.
+- **Fetch at boot** — the script does `curl https://master/bootstrap` or
+  reads from a discovery endpoint you maintain. No credentials in
+  autoscaler config.
+- **Bake into a per-cluster VM image** — a baked-in `/etc/kubeadm.env`
+  file is `source`d at boot. Image rebuild is the rotation mechanism.
 
-1. Update the relevant key(s) of the `cluster-autoscaler-startup-env` Secret.
-   Each key is independent — `kubectl patch secret … --patch '{"stringData":{"JOIN_TOKEN":"<new>"}}'` rotates one value without re-encoding a JSON blob.
-2. `kubectl rollout restart deployment/cluster-autoscaler -n cluster-autoscaler` — the new pod picks up the new env-var values.
-3. New VMs provisioned after the restart use the rotated token. VMs already in the cluster are unaffected.
+### Per-VM identity (provider-id and labels)
 
-In production, source the four startup-env values from a secret manager
-(sealed-secrets, External Secrets Operator, Vault, etc.) rather than
-committing them to a manifest. K8s `envFrom: secretRef:` works the same
-way regardless of how the underlying Secret is populated.
+Per-VM identity (`spec.providerID`, cloud labels) is set **after** the
+node joins the cluster, by
+`verdacloud-cloud-controller-manager`. The startup script uses
+`--cloud-provider=external` on kubelet and does **not** need to know
+its providerID in advance.
 
-> **Operator note**: do **not** include `KEY=""` placeholder lines (e.g.
-> `MASTER_IP=""`, `PROVIDER_ID=""`) at the top of your `startupScript`.
-> The autoscaler-prepended `export` block sets these vars; a subsequent
-> bare assignment in the script body would overwrite them with empty
-> strings. Use `${VAR:?required}` or `set -u` to fail fast on missing
-> values instead.
+This is a hard requirement: the autoscaler no longer injects `PROVIDER_ID`
+or `LABELS` into the script. Without the CCM, new nodes will register
+with `node.cloudprovider.kubernetes.io/uninitialized:NoSchedule` taint and
+nothing will remove it. Deploy verdacloud-CCM before deploying the
+autoscaler (see the verdacloud-cloud-controller-manager repo for install
+instructions).
 
 ## Development
 

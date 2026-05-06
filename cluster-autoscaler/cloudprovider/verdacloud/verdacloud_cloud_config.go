@@ -42,16 +42,6 @@ type cloudConfig struct {
 	Groups             map[string]GroupConfig `json:"groups"`
 	OSVolumeSize       int                    `json:"osVolumeSize"`
 
-	// Cluster-wide startup-script env values. Sourced from the
-	// cluster-autoscaler-startup-env Secret via envFrom on the autoscaler
-	// container, NOT from cluster-config.json. Set by createVerdacloudManager
-	// after JSON decode. Propagated to each VM as `export MASTER_IP=...` etc.
-	// in renderStartupScript so the operator's bash can read them.
-	MasterIP     string `json:"-"`
-	MasterPort   string `json:"-"`
-	JoinToken    string `json:"-"`
-	JoinHashFull string `json:"-"`
-
 	// ReapOrphanNodes opts into deleting K8s Nodes whose VerdaCloud VMs are
 	// gone. Default false; intended only for clusters without a CCM.
 	ReapOrphanNodes bool `json:"reapOrphanNodes"`
