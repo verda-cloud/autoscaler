@@ -148,25 +148,49 @@ stringData:
   client-secret: "your-client-secret"
 
 ---
+# Secret holding the four sensitive cluster-join values. Each key maps
+# directly to an env var on the autoscaler container via the `envFrom:
+# secretRef:` block on the Deployment. The autoscaler reads them at boot,
+# stores them on cloudConfig, and substitutes them into the operator's
+# startupScript template (Go text/template) at scale-up time.
+#
+# Independent rotation: `kubectl patch secret cluster-autoscaler-startup-env
+# -n cluster-autoscaler --patch '{"stringData":{"JOIN_TOKEN":"<new>"}}'`
+# updates one value without re-encoding a JSON blob; rolling-restart the
+# autoscaler and new VMs use the new value.
+#
+# In production, source these from a secret manager (sealed-secrets,
+# External Secrets Operator, Vault, etc.) rather than committing them here.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cluster-autoscaler-startup-env
+  namespace: cluster-autoscaler
+  labels:
+    app: cluster-autoscaler
+type: Opaque
+stringData:
+  MASTER_IP: ""
+  MASTER_PORT: ""
+  JOIN_TOKEN: ""
+  JOIN_HASH_FULL: ""
+
+---
 # ConfigMap containing cluster configuration.
 #
-# The autoscaler is a pure pass-through for `startupScript`: the bytes you
-# put here are decoded and uploaded to Verda's CreateStartupScript API
-# verbatim before each VM is created. No env-var injection, no template
-# substitution, no regex rewriting.
+# The `startupScript` is a Go text/template (NOT a shell script with
+# `KEY="..."` placeholders). The autoscaler renders the template per
+# scale-up, substituting four cluster-wide variables from the
+# cluster-autoscaler-startup-env Secret:
+#   {{.MasterIP}}, {{.MasterPort}}, {{.JoinToken}}, {{.JoinHashFull}}
 #
-# Implication: anything your script needs (kubeadm join token, master IP,
-# etc.) must come from somewhere YOU control. Common patterns:
-#   - hardcode values in the script body (simplest; values visible in
-#     this ConfigMap and in Verda's StartupScript API);
-#   - have the script fetch them at boot from a discovery endpoint or
-#     metadata service;
-#   - bake them into a per-cluster VM image and source them at boot.
+# Other variables ({{.X}} where X is not in StartupScriptTemplateData)
+# fail the template at scale-up with `Option("missingkey=error")` —
+# typo detection without burning a VM-provision cycle.
 #
 # Per-VM identity (provider-id, node labels) is set post-join by the
-# verdacloud cloud-controller-manager; the script uses
-# `--cloud-provider=external` and does not need to know its providerID
-# in advance.
+# verdacloud cloud-controller-manager; the rendered script uses
+# `--cloud-provider=external` and does not need to know its providerID.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -193,8 +217,8 @@ data:
       "reapOrphanNodes": false,
       "reapOrphanNodesAfterCycles": 3,
       "labels": ["env=production"],
-      "_comment_startupScript": "Operator-owned bash, sent verbatim to Verda's CreateStartupScript API. Hardcode MASTER_IP/MASTER_PORT/JOIN_TOKEN/JOIN_HASH_FULL OR fetch them at boot from your own discovery mechanism. Per-VM identity (provider-id, labels) is set post-join by verdacloud-cloud-controller-manager via --cloud-provider=external; the script does not need to know its providerID in advance.",
-      "startupScript": "IyEvdXNyL2Jpbi9lbnYgYmFzaApzZXQgLWV1byBwaXBlZmFpbAoKIyMjID09PT09PSBDT05GSUdVUkUgVEhFU0UgPT09PT09ICMjIwojIEhhcmRjb2RlIHZhbHVlcyBPUiBmZXRjaCB0aGVtIGF0IGJvb3QgZnJvbSB5b3VyIG93biBtZWNoYW5pc20uIFRoZQojIGF1dG9zY2FsZXIgZG9lcyBOT1QgaW5qZWN0IGFueXRoaW5nIGludG8gdGhpcyBzY3JpcHQg4oCUIGl0cyBieXRlcyBhcmUgc2VudAojIHZlcmJhdGltIHRvIFZlcmRhJ3MgQ3JlYXRlU3RhcnR1cFNjcmlwdCBBUEkuCk1BU1RFUl9JUD0iIgpNQVNURVJfUE9SVD0iIgpKT0lOX1RPS0VOPSIiCkpPSU5fSEFTSF9GVUxMPSIiCiMjIyA9PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0gIyMjCgo6ICIke01BU1RFUl9JUDo/cmVxdWlyZWR9Igo6ICIke01BU1RFUl9QT1JUOj9yZXF1aXJlZH0iCjogIiR7Sk9JTl9UT0tFTjo/cmVxdWlyZWR9Igo6ICIke0pPSU5fSEFTSF9GVUxMOj9yZXF1aXJlZH0iCgppZiBbIC1mIC9ldGMva3ViZXJuZXRlcy9rdWJlbGV0LmNvbmYgXTsgdGhlbgogIGVjaG8gIk5vZGUgYWxyZWFkeSBqb2luZWQuIgogIGV4aXQgMApmaQoKIyBEZWZlciBwcm92aWRlcklEICsgY2xvdWQgbGFiZWxzIHRvIHZlcmRhY2xvdWQtY2xvdWQtY29udHJvbGxlci1tYW5hZ2VyLgpbIC1mIC9ldGMvZGVmYXVsdC9rdWJlbGV0IF0gfHwgOiA+IC9ldGMvZGVmYXVsdC9rdWJlbGV0CmlmICEgZ3JlcCAtcSAtLSAnLS1jbG91ZC1wcm92aWRlcj1leHRlcm5hbCcgL2V0Yy9kZWZhdWx0L2t1YmVsZXQ7IHRoZW4KICBlY2hvICdLVUJFTEVUX0VYVFJBX0FSR1M9Ii0tY2xvdWQtcHJvdmlkZXI9ZXh0ZXJuYWwiJyA+PiAvZXRjL2RlZmF1bHQva3ViZWxldApmaQpzeXN0ZW1jdGwgZGFlbW9uLXJlZXhlYwpzeXN0ZW1jdGwgcmVzdGFydCBrdWJlbGV0IHx8IHRydWUKCmt1YmVhZG0gam9pbiAiJHtNQVNURVJfSVB9OiR7TUFTVEVSX1BPUlR9IiBcCiAgLS10b2tlbiAiJHtKT0lOX1RPS0VOfSIgXAogIC0tZGlzY292ZXJ5LXRva2VuLWNhLWNlcnQtaGFzaCAiJHtKT0lOX0hBU0hfRlVMTH0iIFwKICAtLW5vZGUtbmFtZSAiJChob3N0bmFtZSkiCgplY2hvICJKb2luZWQuIENDTSB3aWxsIHBvcHVsYXRlIHByb3ZpZGVySUQgKyBsYWJlbHMuIgo=",
+      "_comment_startupScript": "Operator-owned bash, rendered as a Go text/template at scale-up. The autoscaler substitutes {{.MasterIP}}, {{.MasterPort}}, {{.JoinToken}}, {{.JoinHashFull}} from the cluster-autoscaler-startup-env Secret (via envFrom on the autoscaler container). Per-VM identity (provider-id, labels) is set post-join by verdacloud-cloud-controller-manager via --cloud-provider=external; the script does not need to know its providerID in advance. References to other {{.X}} variables fail the template at scale-up with Option(missingkey=error) — typo detection without burning a VM-provision cycle.",
+      "startupScript": "IyEvdXNyL2Jpbi9lbnYgYmFzaApzZXQgLWV1byBwaXBlZmFpbAoKaWYgWyAtZiAvZXRjL2t1YmVybmV0ZXMva3ViZWxldC5jb25mIF07IHRoZW4KICBlY2hvICJBbHJlYWR5IGpvaW5lZC4iCiAgZXhpdCAwCmZpCgojIERlZmVyIHByb3ZpZGVySUQgKyBjbG91ZCBsYWJlbHMgdG8gdmVyZGFjbG91ZC1jbG91ZC1jb250cm9sbGVyLW1hbmFnZXIuClsgLWYgL2V0Yy9kZWZhdWx0L2t1YmVsZXQgXSB8fCA6ID4gL2V0Yy9kZWZhdWx0L2t1YmVsZXQKaWYgISBncmVwIC1xIC0tICctLWNsb3VkLXByb3ZpZGVyPWV4dGVybmFsJyAvZXRjL2RlZmF1bHQva3ViZWxldDsgdGhlbgogIGVjaG8gJ0tVQkVMRVRfRVhUUkFfQVJHUz0iLS1jbG91ZC1wcm92aWRlcj1leHRlcm5hbCInID4+IC9ldGMvZGVmYXVsdC9rdWJlbGV0CmZpCnN5c3RlbWN0bCBkYWVtb24tcmVleGVjCnN5c3RlbWN0bCByZXN0YXJ0IGt1YmVsZXQgfHwgdHJ1ZQoKa3ViZWFkbSBqb2luICJ7ey5NYXN0ZXJJUH19Ont7Lk1hc3RlclBvcnR9fSIgXAogIC0tdG9rZW4gInt7LkpvaW5Ub2tlbn19IiBcCiAgLS1kaXNjb3ZlcnktdG9rZW4tY2EtY2VydC1oYXNoICJ7ey5Kb2luSGFzaEZ1bGx9fSIgXAogIC0tbm9kZS1uYW1lICIkKGhvc3RuYW1lKSIKCmVjaG8gIkpvaW5lZC4gQ0NNIHdpbGwgcG9wdWxhdGUgcHJvdmlkZXJJRCArIGxhYmVscy4iCg==",
       "taints": [],
       "groups": {
         "asg-name-here": {
@@ -288,6 +312,14 @@ spec:
           value: "https://api.verda.com/v1"
         - name: VERDA_CLUSTER_CONFIG_FILE
           value: "/etc/verdacloud/cluster-config.json"
+        # MASTER_IP / MASTER_PORT / JOIN_TOKEN / JOIN_HASH_FULL arrive here
+        # as env vars from the cluster-autoscaler-startup-env Secret. The
+        # autoscaler reads them at boot via os.Getenv (verdacloud_manager.go),
+        # stores them on cloudConfig, and substitutes them into each
+        # operator's startupScript template at scale-up.
+        envFrom:
+        - secretRef:
+            name: cluster-autoscaler-startup-env
         livenessProbe:
           failureThreshold: 3
           httpGet:
