@@ -140,11 +140,45 @@ The last example uses a custom hostname prefix `custom-node`, so instances will 
 
 You can find a complete deployment sample under [examples/cluster-autoscaler-deployment-example.yaml](examples/cluster-autoscaler-deployment-example.yaml). This single file contains all required Kubernetes resources including namespace, RBAC, secrets, configmap, and deployment. Please be aware that you should change the values within this deployment to reflect your cluster:
 
-- Replace `your-client-id` and `your-client-secret` in the Secret
+- Replace `your-client-id` and `your-client-secret` in the `verdacloud-credentials` Secret
+- Set `MASTER_IP`, `MASTER_PORT`, `JOIN_TOKEN`, and `JOIN_HASH_FULL` in the `cluster-autoscaler-startup-env` Secret (see [Cluster join credentials](#cluster-join-credentials) below)
 - Update `your-ssh-key-id` in the ConfigMap
-- Configure your cluster join parameters (`MASTER_IP`, `JOIN_TOKEN`, `JOIN_HASH_FULL`)
 - Modify the `--nodes` flags to match your desired instance types and scaling limits
 - Update the startup script with your actual base64-encoded cluster join script
+
+### Cluster join credentials
+
+`JOIN_TOKEN` and `JOIN_HASH_FULL` are kubeadm credentials that grant any holder
+the ability to join a node to your cluster. They are stored in a separate
+Kubernetes `Secret` (`cluster-autoscaler-startup-env`), not in the ConfigMap,
+so they never appear in plaintext via `kubectl describe configmap` or generic
+cluster dumps.
+
+At pod startup, an `InitContainer` (`merge-config`) deep-merges the partial
+ConfigMap with this Secret into a single `cluster-config.json` on an
+`emptyDir` volume, which the autoscaler container then reads. The autoscaler
+binary itself still consumes one config file with the schema documented
+above — the split is invisible to it.
+
+```text
+ConfigMap (partial)  ─┐
+                      ├─►  InitContainer (jq merge)  ─►  emptyDir/cluster-config.json  ─►  autoscaler
+Secret (startup-env) ─┘
+```
+
+To rotate `JOIN_TOKEN` / `JOIN_HASH_FULL`:
+
+1. Update the `cluster-autoscaler-startup-env` Secret with the new values.
+2. Trigger a rolling restart of the Deployment
+   (`kubectl rollout restart deployment/cluster-autoscaler -n cluster-autoscaler`).
+3. The new pod's InitContainer regenerates the merged config from the rotated
+   Secret.
+
+In production, source the four startup-env values from a secret manager
+(sealed-secrets, External Secrets Operator, Vault, etc.) rather than
+committing them to a manifest. The InitContainer's merge step is unchanged in
+either case — it always reads from the `cluster-autoscaler-startup-env`
+Secret resource regardless of how that resource is populated.
 
 ## Development
 
