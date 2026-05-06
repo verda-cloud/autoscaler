@@ -126,7 +126,6 @@ func TestCloudConfig_GetNodeConfig_WithoutGroups(t *testing.T) {
 		BillingConfig:      billingConfig{Price: "DYNAMIC", Contract: "PAY_AS_YOU_GO"},
 		Labels:             []string{"env=prod", "team=backend"},
 		StartupScript:      "base64script",
-		StartupScriptEnv:   map[string]string{"MASTER_IP": "10.0.0.1"},
 		AvailableLocations: []string{"FIN-01"},
 		Taints:             []apiv1.Taint{globalTaint},
 	}
@@ -144,9 +143,6 @@ func TestCloudConfig_GetNodeConfig_WithoutGroups(t *testing.T) {
 	}
 	if len(nodeCfg.Taints) != 1 || nodeCfg.Taints[0].Key != "dedicated" {
 		t.Errorf("Expected global taints, got %v", nodeCfg.Taints)
-	}
-	if nodeCfg.StartupScriptEnv["MASTER_IP"] != "10.0.0.1" {
-		t.Errorf("Expected MASTER_IP=10.0.0.1, got %s", nodeCfg.StartupScriptEnv["MASTER_IP"])
 	}
 }
 
@@ -356,7 +352,6 @@ func TestCloudConfig_GetNodeConfig_AllFieldsMerge(t *testing.T) {
 		BillingConfig:      billingConfig{Price: "DYNAMIC", Contract: "PAY_AS_YOU_GO"},
 		Labels:             []string{"env=prod"},
 		StartupScript:      "base64script",
-		StartupScriptEnv:   map[string]string{"MASTER_IP": "10.0.0.1"},
 		AvailableLocations: []string{"FIN-01"},
 		Taints:             []apiv1.Taint{globalTaint},
 		Groups: map[string]GroupConfig{
@@ -394,9 +389,6 @@ func TestCloudConfig_GetNodeConfig_AllFieldsMerge(t *testing.T) {
 		t.Errorf("Expected group taint, got %v", nodeCfg.Taints)
 	}
 
-	if nodeCfg.StartupScriptEnv["MASTER_IP"] != "10.0.0.1" {
-		t.Errorf("Expected global MASTER_IP, got %s", nodeCfg.StartupScriptEnv["MASTER_IP"])
-	}
 }
 
 func TestCloudConfig_GetNodeConfig_EmptyGroupDoesNotMerge(t *testing.T) {
@@ -435,7 +427,6 @@ func TestCloudConfig_GetNodeConfig_NoMutation(t *testing.T) {
 		BillingConfig:      billingConfig{Price: "DYNAMIC", Contract: "PAY_AS_YOU_GO"},
 		Labels:             []string{"env=prod"},
 		StartupScript:      "base64script",
-		StartupScriptEnv:   map[string]string{"MASTER_IP": "10.0.0.1"},
 		AvailableLocations: []string{"FIN-01"},
 		Taints:             []apiv1.Taint{{Key: "global", Value: "taint", Effect: apiv1.TaintEffectNoSchedule}},
 		Groups: map[string]GroupConfig{

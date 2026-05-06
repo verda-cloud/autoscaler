@@ -780,7 +780,9 @@ func (m *autoScalingGroups) createInstanceForAsg(ctx context.Context, asg *Asg, 
 }
 
 // Generates/provisions a custom startup script for the instance per ASG/node config.
-// Also handles patching K8s label env vars into the script content.
+// Prepends an `export VAR=...` block (per-VM PROVIDER_ID/LABELS plus the four
+// cluster-wide kubeadm credentials sourced from the autoscaler's env vars)
+// and ships the resulting script body to Verda's CreateStartupScript API.
 func (m *autoScalingGroups) createStartupScript(ctx context.Context, asg *Asg, nodeConfig *nodeConfig, providerID string) (string, error) {
 	scriptName := fmt.Sprintf("as-%s", asg.Name)
 	decodedScript, err := base64.StdEncoding.DecodeString(nodeConfig.StartupScript)
@@ -788,22 +790,22 @@ func (m *autoScalingGroups) createStartupScript(ctx context.Context, asg *Asg, n
 		return "", fmt.Errorf("failed to decode startup script: %v", err)
 	}
 
-	startupScriptEnv := make(map[string]string, len(nodeConfig.StartupScriptEnv)+2)
-	for k, v := range nodeConfig.StartupScriptEnv {
-		startupScriptEnv[strings.ToUpper(k)] = v
-	}
-	startupScriptEnv["PROVIDER_ID"] = providerID
 	labels := convertConfigLabelsToK8sLabels(nodeConfig.Labels, asg)
-	startupScriptEnv["LABELS"] = labels
+	klog.V(4).Infof("Rendering startup script with PROVIDER_ID=%s, LABELS=%s", providerID, labels)
 
-	klog.V(4).Infof("Patching startup script with PROVIDER_ID=%s, LABELS=%s", providerID, labels)
-
-	patchedScript, err := injectEnvVarsIntoScript(decodedScript, startupScriptEnv)
-	if err != nil {
-		return "", fmt.Errorf("failed to patch startup script: %w", err)
+	env := startupEnv{
+		ProviderID: providerID,
+		Labels:     labels,
 	}
+	if m.cfg != nil {
+		env.MasterIP = m.cfg.MasterIP
+		env.MasterPort = m.cfg.MasterPort
+		env.JoinToken = m.cfg.JoinToken
+		env.JoinHashFull = m.cfg.JoinHashFull
+	}
+	rendered := renderStartupScript(decodedScript, env)
 
-	script, err := m.dcService.CreateStartScript(ctx, scriptName, string(patchedScript))
+	script, err := m.dcService.CreateStartScript(ctx, scriptName, string(rendered))
 	if err != nil {
 		klog.Errorf("CreateStartScript API call failed: %v", err)
 		return "", fmt.Errorf("failed to create startup script: %v", err)

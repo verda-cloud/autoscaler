@@ -19,7 +19,6 @@ package verdacloud
 import (
 	"errors"
 	"fmt"
-	"maps"
 	"strings"
 
 	apiv1 "k8s.io/api/core/v1"
@@ -39,10 +38,19 @@ type cloudConfig struct {
 	Debug              bool                   `json:"debug"`
 	AvailableLocations []string               `json:"availableLocations"`
 	StartupScript      string                 `json:"startupScript"`
-	StartupScriptEnv   map[string]string      `json:"startupScriptEnv"`
 	Taints             []apiv1.Taint          `json:"taints"`
 	Groups             map[string]GroupConfig `json:"groups"`
 	OSVolumeSize       int                    `json:"osVolumeSize"`
+
+	// Cluster-wide startup-script env values. Sourced from the
+	// cluster-autoscaler-startup-env Secret via envFrom on the autoscaler
+	// container, NOT from cluster-config.json. Set by createVerdacloudManager
+	// after JSON decode. Propagated to each VM as `export MASTER_IP=...` etc.
+	// in renderStartupScript so the operator's bash can read them.
+	MasterIP     string `json:"-"`
+	MasterPort   string `json:"-"`
+	JoinToken    string `json:"-"`
+	JoinHashFull string `json:"-"`
 
 	// ReapOrphanNodes opts into deleting K8s Nodes whose VerdaCloud VMs are
 	// gone. Default false; intended only for clusters without a CCM.
@@ -77,7 +85,6 @@ type nodeConfig struct {
 	IsSpot             bool
 	Image              string
 	StartupScript      string
-	StartupScriptEnv   map[string]string
 	SSHKeyIDs          []string
 	OSVolumeSize       int
 	Labels             []string
@@ -133,9 +140,6 @@ func (cfg *cloudConfig) isValid() bool {
 func (cfg *cloudConfig) GetNodeConfig(asgName string) *nodeConfig {
 	billingCfg := cfg.BillingConfig
 
-	startupScriptEnv := make(map[string]string, len(cfg.StartupScriptEnv))
-	maps.Copy(startupScriptEnv, cfg.StartupScriptEnv)
-
 	labels := mergeLabels(cfg.Labels, nil)
 	taints := mergeTaints(cfg.Taints, nil)
 
@@ -170,7 +174,6 @@ func (cfg *cloudConfig) GetNodeConfig(asgName string) *nodeConfig {
 		IsSpot:             billingCfg.Contract == BillingContractSpot,
 		Image:              "", // set by caller based on GPU/CPU
 		StartupScript:      cfg.StartupScript,
-		StartupScriptEnv:   startupScriptEnv,
 		SSHKeyIDs:          cfg.SSHKeyIDs,
 		OSVolumeSize:       osVolumeSize,
 		Labels:             labels,
