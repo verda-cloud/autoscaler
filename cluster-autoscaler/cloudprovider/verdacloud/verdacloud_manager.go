@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -84,6 +85,16 @@ func createVerdacloudManager(cloudReader io.Reader, discoveryOpts cloudprovider.
 	}
 
 	cfg = verifyCloudConfigAndPatch(cfg)
+
+	// Cluster-wide template values come from env vars on the autoscaler
+	// container (envFrom: secretRef: cluster-autoscaler-startup-env on the
+	// Deployment), never from cluster-config.json. Empty values are accepted;
+	// the operator's startup-script template enforces presence via
+	// `Option("missingkey=error")` semantics — see verdacloud_startup_render.go.
+	cfg.MasterIP = os.Getenv("MASTER_IP")
+	cfg.MasterPort = os.Getenv("MASTER_PORT")
+	cfg.JoinToken = os.Getenv("JOIN_TOKEN")
+	cfg.JoinHashFull = os.Getenv("JOIN_HASH_FULL")
 
 	sdkProvider, err := createVerdacloudSDKProvider(cfg)
 	if err != nil {

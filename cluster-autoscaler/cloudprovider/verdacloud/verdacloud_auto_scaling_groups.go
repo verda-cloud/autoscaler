@@ -781,16 +781,22 @@ func (m *autoScalingGroups) createInstanceForAsg(ctx context.Context, asg *Asg, 
 
 // Generates/provisions the startup script for a new instance.
 //
-// Pure pass-through: decode the operator's base64-encoded startupScript and
-// upload its bytes to Verda's CreateStartupScript API verbatim. No
-// transformation. The operator owns all script content including any
-// kubeadm credentials, fetch logic, hostname-discovery, etc.
+// Decodes the operator's base64-encoded startupScript, executes it as a
+// Go text/template against the cluster-wide values populated from env vars
+// (see createVerdacloudManager), and uploads the rendered bytes to Verda's
+// CreateStartupScript API. Pattern mirrors equinixmetal/cherryservers
+// providers.
 //
-// Per-VM identity (provider-id, labels) is set post-join by
-// verdacloud-cloud-controller-manager (`--cloud-provider=external` on
-// kubelet). The autoscaler does not inject those values.
+// Variables exposed: MasterIP, MasterPort, JoinToken, JoinHashFull. Per-VM
+// identity (provider-id, labels) is intentionally NOT exposed —
+// verdacloud-cloud-controller-manager owns those post-join.
 //
-// `providerID` is still computed by the caller because it remains the
+// Failure modes (caught at scale-up before any VM is created): operator's
+// template has bad syntax (parse error) or references a variable not on
+// StartupScriptTemplateData (missing-key error). See
+// verdacloud_startup_render.go for the renderer.
+//
+// providerID is still computed by the caller because it remains the
 // hostname-derivation key the autoscaler uses for instance lookups; it is
 // no longer threaded into the script.
 func (m *autoScalingGroups) createStartupScript(ctx context.Context, asg *Asg, nodeConfig *nodeConfig, _ string) (string, error) {
@@ -800,7 +806,19 @@ func (m *autoScalingGroups) createStartupScript(ctx context.Context, asg *Asg, n
 		return "", fmt.Errorf("failed to decode startup script: %v", err)
 	}
 
-	script, err := m.dcService.CreateStartScript(ctx, scriptName, string(decodedScript))
+	vars := StartupScriptTemplateData{}
+	if m.cfg != nil {
+		vars.MasterIP = m.cfg.MasterIP
+		vars.MasterPort = m.cfg.MasterPort
+		vars.JoinToken = m.cfg.JoinToken
+		vars.JoinHashFull = m.cfg.JoinHashFull
+	}
+	rendered, err := renderStartupScript(decodedScript, vars)
+	if err != nil {
+		return "", fmt.Errorf("render startup script: %w", err)
+	}
+
+	script, err := m.dcService.CreateStartScript(ctx, scriptName, string(rendered))
 	if err != nil {
 		klog.Errorf("CreateStartScript API call failed: %v", err)
 		return "", fmt.Errorf("failed to create startup script: %v", err)
