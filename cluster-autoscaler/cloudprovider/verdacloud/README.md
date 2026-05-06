@@ -30,12 +30,6 @@ The cluster autoscaler for VerdaCloud (formerly DataCrunch.io) scales worker nod
   "osVolumeSize": 50,
   "labels": ["env=production"],
   "startupScript": "base64 encoded cloud init script. refer to example config",
-  "startupScriptEnv": {
-    "MASTER_IP": "",
-    "MASTER_PORT": "",
-    "JOIN_TOKEN": "",
-    "JOIN_HASH_FULL": ""
-  },
   "taints": [],
   "groups": {
     "asg-name-here": {
@@ -69,8 +63,7 @@ The JSON above is the authoritative format. This table summarizes top‑level ke
 | availableLocations | array<string> | required | — | Location codes eligible for provisioning. Group config overwrites global. |
 | osVolumeSize | int | optional | 50 | Size of the OS volume in GB. Group config overwrites global. |
 | labels | array<string> | optional | — | Labels to apply to all nodes. Group config merges with global. |
-| startupScript | string (base64) | required | — | Base64‑encoded startup script. Use the default script provided in `examples/config.json`. |
-| startupScriptEnv | map<string,string> | required | — | Environment variables for the startup script. Must align with `startupScript`. |
+| startupScript | string (base64) | required | — | Base64‑encoded operator-owned bash script. The autoscaler prepends six exported env vars (`MASTER_IP`, `MASTER_PORT`, `JOIN_TOKEN`, `JOIN_HASH_FULL`, `PROVIDER_ID`, `LABELS`) before sending the script to Verda's API. The script reads them via `$VAR` references and is responsible for fail-fast on missing values (`set -u` or `${VAR:?required}`). See [`examples/config.json`](examples/config.json). |
 | taints | array<object> | optional | — | Standard k8s taint objects applied to nodes |
 | groups | map<string,object> | optional | — | Node group definitions overriding defaults. See below for supported keys. |
 | reapOrphanNodes | bool | optional | false | Opt-in: when true, the autoscaler deletes K8s `Node` objects whose VerdaCloud VMs have disappeared from the API. Intended only for clusters that **do not** run a verdacloud cloud-controller-manager. Once a CCM is deployed it owns Node lifecycle and this flag should remain off. See [Orphan-node reaping](#orphan-node-reaping) below. |
@@ -148,37 +141,57 @@ You can find a complete deployment sample under [examples/cluster-autoscaler-dep
 
 ### Cluster join credentials
 
-`JOIN_TOKEN` and `JOIN_HASH_FULL` are kubeadm credentials that grant any holder
-the ability to join a node to your cluster. They are stored in a separate
-Kubernetes `Secret` (`cluster-autoscaler-startup-env`), not in the ConfigMap,
-so they never appear in plaintext via `kubectl describe configmap` or generic
-cluster dumps.
+`MASTER_IP`, `MASTER_PORT`, `JOIN_TOKEN`, and `JOIN_HASH_FULL` are the
+cluster-join values your operator-owned `startupScript` needs to run
+`kubeadm join`. They live in a Kubernetes `Secret`
+(`cluster-autoscaler-startup-env`), separate from the ConfigMap, so
+`JOIN_TOKEN` and `JOIN_HASH_FULL` never appear in plaintext via
+`kubectl describe configmap` or generic cluster dumps.
 
-At pod startup, an `InitContainer` (`merge-config`) deep-merges the partial
-ConfigMap with this Secret into a single `cluster-config.json` on an
-`emptyDir` volume, which the autoscaler container then reads. The autoscaler
-binary itself still consumes one config file with the schema documented
-above — the split is invisible to it.
+The autoscaler container reads them as standard env vars via
+`envFrom: secretRef: cluster-autoscaler-startup-env` on the Deployment.
+Each scale-up, the autoscaler prepends an `export VAR='...'` block to the
+operator's decoded `startupScript` before sending it to Verda's
+`CreateStartupScript` API. The operator's bash references them with normal
+`$VAR` syntax — no template engine, no regex placeholders.
 
 ```text
-ConfigMap (partial)  ─┐
-                      ├─►  InitContainer (jq merge)  ─►  emptyDir/cluster-config.json  ─►  autoscaler
-Secret (startup-env) ─┘
+K8s Secret (4 keys)         autoscaler container          new VM (cloud-init)
+┌─────────────────────┐     ┌──────────────────┐         ┌──────────────────┐
+│ MASTER_IP=...       │ ──► │ envFrom maps to  │ ──prepend export ─►        │
+│ MASTER_PORT=...     │     │ env vars on the  │  block of `export VAR=...` │
+│ JOIN_TOKEN=...      │     │ autoscaler proc  │  in front of operator body │
+│ JOIN_HASH_FULL=...  │     └──────────────────┘  ───►  CreateStartupScript │
+└─────────────────────┘                                                     │
+                                                          bash sees:        │
+                                                            $MASTER_IP      │
+                                                            $JOIN_TOKEN     │
+                                                            $PROVIDER_ID    │
+                                                            (and runs)      │
+                                                          └─────────────────┘
 ```
+
+The autoscaler also injects two **per-VM** values (`PROVIDER_ID`, `LABELS`)
+computed at scale-up time. They join the same prepended block.
 
 To rotate `JOIN_TOKEN` / `JOIN_HASH_FULL`:
 
-1. Update the `cluster-autoscaler-startup-env` Secret with the new values.
-2. Trigger a rolling restart of the Deployment
-   (`kubectl rollout restart deployment/cluster-autoscaler -n cluster-autoscaler`).
-3. The new pod's InitContainer regenerates the merged config from the rotated
-   Secret.
+1. Update the relevant key(s) of the `cluster-autoscaler-startup-env` Secret.
+   Each key is independent — `kubectl patch secret … --patch '{"stringData":{"JOIN_TOKEN":"<new>"}}'` rotates one value without re-encoding a JSON blob.
+2. `kubectl rollout restart deployment/cluster-autoscaler -n cluster-autoscaler` — the new pod picks up the new env-var values.
+3. New VMs provisioned after the restart use the rotated token. VMs already in the cluster are unaffected.
 
 In production, source the four startup-env values from a secret manager
 (sealed-secrets, External Secrets Operator, Vault, etc.) rather than
-committing them to a manifest. The InitContainer's merge step is unchanged in
-either case — it always reads from the `cluster-autoscaler-startup-env`
-Secret resource regardless of how that resource is populated.
+committing them to a manifest. K8s `envFrom: secretRef:` works the same
+way regardless of how the underlying Secret is populated.
+
+> **Operator note**: do **not** include `KEY=""` placeholder lines (e.g.
+> `MASTER_IP=""`, `PROVIDER_ID=""`) at the top of your `startupScript`.
+> The autoscaler-prepended `export` block sets these vars; a subsequent
+> bare assignment in the script body would overwrite them with empty
+> strings. Use `${VAR:?required}` or `set -u` to fail fast on missing
+> values instead.
 
 ## Development
 
