@@ -95,104 +95,92 @@ func TestIsGPUInstanceType(t *testing.T) {
 	}
 }
 
-func TestConvertConfigLabelsToK8sLabels(t *testing.T) {
-	// Test CPU instance - should NOT have accelerator label
-	cpuAsg := &Asg{AsgRef: AsgRef{Name: "asg-cpu"}, instanceType: testUtilInstanceType}
-	cpuLabels := convertConfigLabelsToK8sLabels([]string{"env=prod"}, cpuAsg)
-	if !containsAllSubstrings(t, cpuLabels, []string{"env=prod", NodeGroupLabelKey + "=asg-cpu"}) {
-		t.Fatalf("unexpected CPU labels: %s", cpuLabels)
-	}
-	// CPU nodes should NOT have accelerator label
-	if strings.Contains(cpuLabels, AcceleratorLabel) {
-		t.Fatalf("CPU node should not have accelerator label: %s", cpuLabels)
-	}
+// --------------------------------------------------------------------------
+// renderStartupScript tests
+// --------------------------------------------------------------------------
 
-	// Test GPU instance - should have accelerator label
-	gpuAsg := &Asg{AsgRef: AsgRef{Name: "asg-gpu"}, instanceType: testUtilGPUType}
-	gpuLabels := convertConfigLabelsToK8sLabels([]string{"env=prod"}, gpuAsg)
-	if !containsAllSubstrings(t, gpuLabels, []string{"env=prod", NodeGroupLabelKey + "=asg-gpu", AcceleratorLabel + "=" + testUtilGPUType}) {
-		t.Fatalf("unexpected GPU labels: %s", gpuLabels)
+func TestRenderStartupScript_HappyPath(t *testing.T) {
+	body := []byte(`#!/bin/bash
+kubeadm join "{{.MasterIP}}:{{.MasterPort}}" \
+  --token "{{.JoinToken}}" \
+  --discovery-token-ca-cert-hash "{{.JoinHashFull}}"
+`)
+	got, err := renderStartupScript(body, StartupScriptTemplateData{
+		MasterIP:     "10.0.0.10",
+		MasterPort:   "6443",
+		JoinToken:    "abcdef.0123456789abcdef",
+		JoinHashFull: "sha256:1234",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
-}
-
-// containsAllSubstrings checks if string s contains all substrings in wants
-func containsAllSubstrings(t *testing.T, s string, wants []string) bool {
-	t.Helper()
-	for _, w := range wants {
-		if !strings.Contains(s, w) {
-			return false
+	for _, want := range []string{
+		`kubeadm join "10.0.0.10:6443"`,
+		`--token "abcdef.0123456789abcdef"`,
+		`--discovery-token-ca-cert-hash "sha256:1234"`,
+	} {
+		if !strings.Contains(string(got), want) {
+			t.Errorf("rendered output missing %q\n--- got ---\n%s", want, got)
 		}
 	}
-	return true
 }
 
-func TestConvertConfigLabelsToK8sLabels_ComplexLabels(t *testing.T) {
-	tests := []struct {
-		name        string
-		inputLabels []string
-		asg         *Asg
-		expectAll   []string
-	}{
-		{
-			name: "labels with dots and slashes",
-			inputLabels: []string{
-				"datacrunch.io/gpu.installed=8",
-				"datacrunch.io/size-1-gpu=true",
-				"kubernetes.io/role=8.6000PRO",
-			},
-			asg: &Asg{AsgRef: AsgRef{Name: "asg-pro6000-8x"}, instanceType: "GPU.6000PRO.x8"},
-			expectAll: []string{
-				"datacrunch.io/gpu.installed=8",
-				"datacrunch.io/size-1-gpu=true",
-				"kubernetes.io/role=8.6000PRO",
-				NodeGroupLabelKey + "=asg-pro6000-8x",
-				AcceleratorLabel + "=GPU.6000PRO.x8",
-			},
-		},
-		{
-			name: "labels with hyphens and numbers",
-			inputLabels: []string{
-				"node-type=gpu-worker",
-				"version=v1.2.3",
-				"count=100",
-			},
-			asg: &Asg{AsgRef: AsgRef{Name: "gpu-pool"}, instanceType: testUtilGPUType},
-			expectAll: []string{
-				"node-type=gpu-worker",
-				"version=v1.2.3",
-				"count=100",
-				NodeGroupLabelKey + "=gpu-pool",
-				AcceleratorLabel + "=" + testUtilGPUType,
-			},
-		},
-		{
-			name: "labels with underscores and colons",
-			inputLabels: []string{
-				"my_label=value_1",
-				"url=http://example.com",
-			},
-			asg: &Asg{AsgRef: AsgRef{Name: "test-asg"}, instanceType: "CPU.c4m8"},
-			expectAll: []string{
-				"my_label=value_1",
-				"url=http://example.com",
-				NodeGroupLabelKey + "=test-asg",
-			},
-		},
+func TestRenderStartupScript_MissingKeyFailsFast(t *testing.T) {
+	// Operator typo: {{.Mastr}} not in StartupScriptTemplateData.
+	body := []byte(`kubeadm join "{{.Mastr}}:6443"`)
+	_, err := renderStartupScript(body, StartupScriptTemplateData{
+		MasterIP: "10.0.0.10",
+	})
+	if err == nil {
+		t.Fatal("expected missingkey error, got nil")
+	}
+	if !strings.Contains(err.Error(), "Mastr") {
+		t.Errorf("error should name the bad key; got: %v", err)
+	}
+}
+
+func TestRenderStartupScript_ParseErrorFailsFast(t *testing.T) {
+	// Unbalanced template syntax.
+	body := []byte(`kubeadm join "{{.MasterIP"`)
+	_, err := renderStartupScript(body, StartupScriptTemplateData{})
+	if err == nil {
+		t.Fatal("expected parse error for unbalanced template, got nil")
+	}
+	if !strings.Contains(err.Error(), "parse") {
+		t.Errorf("error should mention parse; got: %v", err)
+	}
+}
+
+func TestRenderStartupScript_NoTemplateInBody(t *testing.T) {
+	// Operator's script with no {{...}} references — should pass through unchanged.
+	body := []byte("#!/bin/bash\nset -euo pipefail\necho hello\n")
+	got, err := renderStartupScript(body, StartupScriptTemplateData{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if string(got) != string(body) {
+		t.Errorf("expected pass-through; got:\n%s", got)
+	}
+}
+
+func TestRenderStartupScript_ConditionalAndLoop(t *testing.T) {
+	// Operator using template features beyond plain substitution.
+	body := []byte(`{{ if .JoinToken }}--token={{.JoinToken}}{{ end }}`)
+	got, err := renderStartupScript(body, StartupScriptTemplateData{
+		JoinToken: "abc",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if string(got) != "--token=abc" {
+		t.Errorf("conditional rendering failed; got %q", got)
 	}
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			result := convertConfigLabelsToK8sLabels(tc.inputLabels, tc.asg)
-
-			for _, expected := range tc.expectAll {
-				if !strings.Contains(result, expected) {
-					t.Errorf("expected label %q not found in result: %s", expected, result)
-				}
-			}
-
-			if !strings.Contains(result, ",") && len(tc.inputLabels) > 0 {
-				t.Errorf("expected comma-separated labels, got: %s", result)
-			}
-		})
+	got, err = renderStartupScript(body, StartupScriptTemplateData{}) // empty token
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if string(got) != "" {
+		t.Errorf("expected empty output for empty token branch; got %q", got)
 	}
 }
