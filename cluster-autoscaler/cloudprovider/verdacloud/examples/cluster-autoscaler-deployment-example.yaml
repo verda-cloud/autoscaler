@@ -148,12 +148,11 @@ stringData:
   client-secret: "your-client-secret"
 
 ---
-# Secret containing the four sensitive startup-script environment variables.
-# These were previously in the ConfigMap below, alongside startupScript. They
-# are split out so JOIN_TOKEN / JOIN_HASH_FULL never appear in plaintext via
-# `kubectl describe configmap` or generic cluster dumps. The InitContainer in
-# the Deployment merges this Secret with the ConfigMap into a single
-# cluster-config.json before the autoscaler container starts.
+# Secret containing the four sensitive cluster-join environment variables.
+# Mounted as env vars on the autoscaler container via `envFrom: secretRef`
+# below. The autoscaler prepends these as `export VAR=...` lines onto the
+# operator's startupScript before sending it to Verda's CreateStartupScript
+# API; the operator's bash reads them via standard $VAR references.
 #
 # In production, source these values from a secret manager (sealed-secrets,
 # External Secrets Operator, Vault, etc.) rather than committing them here.
@@ -166,21 +165,17 @@ metadata:
     app: cluster-autoscaler
 type: Opaque
 stringData:
-  startup-env.json: |
-    {
-      "MASTER_IP": "",
-      "MASTER_PORT": "",
-      "JOIN_TOKEN": "",
-      "JOIN_HASH_FULL": ""
-    }
+  MASTER_IP: ""
+  MASTER_PORT: ""
+  JOIN_TOKEN: ""
+  JOIN_HASH_FULL: ""
 
 ---
-# ConfigMap containing the non-sensitive part of the cluster configuration.
-# Note: `startupScriptEnv` is intentionally null here. It is supplied by the
-# `cluster-autoscaler-startup-env` Secret and merged in by the InitContainer.
-# Reading this ConfigMap directly will NOT yield a config the autoscaler can
-# consume — the Deployment's merged file at /etc/verdacloud/cluster-config.json
-# is the runtime source of truth.
+# ConfigMap containing cluster configuration (non-sensitive only).
+# The four sensitive cluster-join values (MASTER_IP / MASTER_PORT /
+# JOIN_TOKEN / JOIN_HASH_FULL) live in the cluster-autoscaler-startup-env
+# Secret and arrive at the autoscaler as env vars via `envFrom: secretRef`
+# on the Deployment.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -189,7 +184,7 @@ metadata:
   labels:
     app: cluster-autoscaler
 data:
-  cluster-config.partial.json: |
+  cluster-config.json: |
     {
       "image": {
         "gpu": "24.04.kubernetes1.31.1.cuda12.9.qcow2",
@@ -207,9 +202,8 @@ data:
       "reapOrphanNodes": false,
       "reapOrphanNodesAfterCycles": 3,
       "labels": ["env=production"],
-      "startupScript": "IyEvdXNyL2Jpbi9lbnYgYmFzaApzZXQgLWV1byBwaXBlZmFpbAoKIyMjID09PT09PSBDT05GSUdVUkUgVEhFU0UgPT09PT09ICMjIwpNQVNURVJfSVA9IiIKTUFTVEVSX1BPUlQ9IiIKCiMgRnJvbSBga3ViZWFkbSB0b2tlbiBjcmVhdGUgLS1wcmludC1qb2luLWNvbW1hbmRgIG9uIHRoZSBtYXN0ZXI6CkpPSU5fVE9LRU49IiIKSk9JTl9IQVNIX0ZVTEw9IiIKCiMgUHJvdmlkZXIgSUQgdG8gcmVnaXN0ZXIgd2l0aCBrdWJlbGV0IChleGFtcGxlIGJlbG93OyByZXBsYWNlIGlmIG5lZWRlZCkKUFJPVklERVJfSUQ9IiIKCiMgTXVsdGlwbGUgbGFiZWxzIGV4YW1wbGUgKGNvbW1hLXNlcGFyYXRlZCwgbm8gc3BhY2VzKQojIElNUE9SVEFOVDogZG8gbm90IGluY2x1ZGUgc3BhY2VzOyBzZXBhcmF0ZSBsYWJlbHMgd2l0aCBjb21tYXMgb25seS4KIyBLZXlzIG1heSBpbmNsdWRlICcvJycKTEFCRUxTPSIiCiMjIyA9PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0gIyMjCgpleHBvcnQgREVCSUFOX0ZST05URU5EPW5vbmludGVyYWN0aXZlCgplY2hvICJbMS8zXSBGYXN0IGV4aXQgaWYgYWxyZWFkeSBqb2luZWQiCmlmIFsgLWYgL2V0Yy9rdWJlcm5ldGVzL2t1YmVsZXQuY29uZiBdOyB0aGVuCiAgZWNobyAiTm9kZSBhbHJlYWR5IGpvaW5lZCAoL2V0Yy9rdWJlcm5ldGVzL2t1YmVsZXQuY29uZiBleGlzdHMpLiBOb3RoaW5nIHRvIGRvLiIKICBleGl0IDAKZmkKCgplY2hvICJbMi8zXSBQcmUtc2V0IGt1YmVsZXQgcHJvdmlkZXItaWQgYW5kIG5vZGUtbGFiZWxzICh2aWEgL2V0Yy9kZWZhdWx0L2t1YmVsZXQpIgoKIyAtLS0gUHJlY29uZGl0aW9uczogZmFpbCBmYXN0IGlmIGVtcHR5IC0tLQppZiBbIC16ICIke1BST1ZJREVSX0lEOi19IiBdOyB0aGVuCiAgZWNobyAiW2Vycm9yXSBQUk9WSURFUl9JRCBpcyBub3Qgc2V0IG9yIGlzIGVtcHR5IgogIGV4aXQgMQpmaQppZiBbIC16ICIke0xBQkVMUzotfSIgXTsgdGhlbgogIGVjaG8gIltlcnJvcl0gTEFCRUxTIGlzIG5vdCBzZXQgb3IgaXMgZW1wdHkiCiAgZXhpdCAxCmZpCgojIE9wdGlvbmFsOiBzdHJpcCBzcGFjZXMgdGhhdCBtaWdodCBzbmVhayBpbiAoZGVmZW5zaXZlKQpMQUJFTFM9IiQocHJpbnRmICclcycgIiRMQUJFTFMiIHwgdHIgLWQgJyAnKSIKCiMgQ3JlYXRlIGZpbGUgaWYgbWlzc2luZwpbIC1mIC9ldGMvZGVmYXVsdC9rdWJlbGV0IF0gfHwgOiA+IC9ldGMvZGVmYXVsdC9rdWJlbGV0CgojIFJlYWQgY3VycmVudCBhcmdzICh1bnF1b3RlZCkKQ1VSUkVOVD0iJChncmVwIC1vRSAnXktVQkVMRVRfRVhUUkFfQVJHUz0uKicgL2V0Yy9kZWZhdWx0L2t1YmVsZXQgfCBzZWQgJ3MvXHIkLy8nIHx8IHRydWUpIgpDVVJSRU5UPSIke0NVUlJFTlQjS1VCRUxFVF9FWFRSQV9BUkdTPX0iICAgICAgICAgICAgICAgICAgICAgICAgICAjIGRyb3AgcHJlZml4CkNVUlJFTlQ9IiR7Q1VSUkVOVCVcIn0iOyBDVVJSRU5UPSIke0NVUlJFTlQjXCJ9IiAgICAgICAgICAgICAgICAgICMgZHJvcCBzdXJyb3VuZGluZyBxdW90ZXMgaWYgYW55CgojIFJlbW92ZSBhbnkgcHJldmlvdXMgZmxhZ3MgdG8gYXZvaWQgZHVwbGljYXRpb24KQ0xFQU5FRD0iJChwcmludGYgJyVzXG4nICIkQ1VSUkVOVCIgXAogIHwgc2VkICdzLy0tcHJvdmlkZXItaWQ9W14gXSovL2cnIFwKICB8IHNlZCAncy8tLW5vZGUtbGFiZWxzPVteIF0qLy9nJyBcCiAgfCB4YXJncykiCgojIENvbnN0cnVjdCBuZXcgZmxhZ3MgKG11bHRpcGxlIGxhYmVscyBzdXBwb3J0ZWQgdmlhIGNvbW1hIGxpc3QpCk5FV19BUkdTPSIkKHByaW50ZiAnJXMgJXMgJXNcbicgIiRDTEVBTkVEIiAiLS1wcm92aWRlci1pZD0ke1BST1ZJREVSX0lEfSIgIi0tbm9kZS1sYWJlbHM9JHtMQUJFTFN9IiB8IHhhcmdzKSIKCiMgV3JpdGUgYmFjayAocXVvdGUgdG8gYmUgc2FmZSkKaWYgZ3JlcCAtcSAnXktVQkVMRVRfRVhUUkFfQVJHUz0nIC9ldGMvZGVmYXVsdC9rdWJlbGV0OyB0aGVuCiAgc2VkIC1pICdzI15LVUJFTEVUX0VYVFJBX0FSR1M9LiojS1VCRUxFVF9FWFRSQV9BUkdTPSInIiRORVdfQVJHUyInIiMnIC9ldGMvZGVmYXVsdC9rdWJlbGV0CmVsc2UKICBlY2hvICdLVUJFTEVUX0VYVFJBX0FSR1M9IiciJE5FV19BUkdTIiciJyA+PiAvZXRjL2RlZmF1bHQva3ViZWxldApmaQoKIyBTaG93IGV4YWN0bHkgd2hhdCB3ZSdsbCBydW4KZWNobyAiW3ByZWZsaWdodF0gL2V0Yy9kZWZhdWx0L2t1YmVsZXQgbm93IGlzOiIKc2VkIC1uICcxLDEyMHAnIC9ldGMvZGVmYXVsdC9rdWJlbGV0CgojIE1ha2Ugc3lzdGVtZCBwaWNrIGl0IHVwCnN5c3RlbWN0bCBkYWVtb24tcmVleGVjCnN5c3RlbWN0bCByZXN0YXJ0IGt1YmVsZXQgfHwgdHJ1ZQoKIyBIYXJkIHZlcmlmaWNhdGlvbiBCRUZPUkUgam9pbgppZiBncmVwIC1xIC0tICItLXByb3ZpZGVyLWlkPSR7UFJPVklERVJfSUR9IiAvZXRjL2RlZmF1bHQva3ViZWxldDsgdGhlbgogIGVjaG8gIltwcmVmbGlnaHRdIHByb3ZpZGVyLWlkIGNvbmZpZ3VyZWQiCmVsc2UKICBlY2hvICJbcHJlZmxpZ2h0XSBwcm92aWRlci1pZCBzdGlsbCBtaXNzaW5nIgogIGV4aXQgMQpmaQoKaWYgZ3JlcCAtcSAtLSAiLS1ub2RlLWxhYmVscz0ke0xBQkVMU30iIC9ldGMvZGVmYXVsdC9rdWJlbGV0OyB0aGVuCiAgZWNobyAiW3ByZWZsaWdodF0gbm9kZS1sYWJlbHMgY29uZmlndXJlZCIKZWxzZQogIGVjaG8gIltwcmVmbGlnaHRdIG5vZGUtbGFiZWxzIHN0aWxsIG1pc3NpbmciCiAgZXhpdCAxCmZpCgplY2hvICJbMi8zXSBKb2luIHRoZSBjbHVzdGVyIgprdWJlYWRtIGpvaW4gIiR7TUFTVEVSX0lQfToke01BU1RFUl9QT1JUfSIgXAogIC0tdG9rZW4gIiR7Sk9JTl9UT0tFTn0iIFwKICAtLWRpc2NvdmVyeS10b2tlbi1jYS1jZXJ0LWhhc2ggIiR7Sk9JTl9IQVNIX0ZVTEx9IiBcCiAgLS1ub2RlLW5hbWUgIiQoaG9zdG5hbWUpIgoKZWNobyAiRG9uZS4gS3ViZWxldCB3aWxsIHJlZ2lzdGVyIHdpdGggcHJvdmlkZXJJRD0nJHtQUk9WSURFUl9JRH0nIGFuZCBsYWJlbHM9JyR7TEFCRUxTfScuIgplY2hvICJWZXJpZnkgZnJvbSBtYXN0ZXI6IgplY2hvICIgIGt1YmVjdGwgZ2V0IG5vZGUgJChob3N0bmFtZSkgLW8ganNvbnBhdGg9J3suc3BlYy5wcm92aWRlcklEfSc7IGVjaG8iCmVjaG8gIiAga3ViZWN0bCBnZXQgbm9kZSAkKGhvc3RuYW1lKSAtLXNob3ctbGFiZWxzIHwgc2VkIC1FICdzLywvLFxuL2cnIHwgc2VkIC1uICcxLDVwJyIK",
-      "_comment_startupScriptEnv": "Supplied by the cluster-autoscaler-startup-env Secret and merged in at pod startup by the merge-config InitContainer. Keep this null here so the merge result is deterministic regardless of jq version.",
-      "startupScriptEnv": null,
+      "_comment_startupScript": "Operator-owned bash. Receives MASTER_IP, MASTER_PORT, JOIN_TOKEN, JOIN_HASH_FULL, PROVIDER_ID, LABELS as exported env vars (autoscaler prepends them). Use $VAR refs and `set -u` (or `${VAR:?required}`) to fail-fast on missing values. Do NOT add `KEY=\"\"` placeholder lines — they would overwrite the autoscaler's exports.",
+      "startupScript": "IyEvdXNyL2Jpbi9lbnYgYmFzaApzZXQgLWV1byBwaXBlZmFpbAoKZWNobyAiWzEvNF0gRmFzdCBleGl0IGlmIGFscmVhZHkgam9pbmVkIgppZiBbIC1mIC9ldGMva3ViZXJuZXRlcy9rdWJlbGV0LmNvbmYgXTsgdGhlbgogIGVjaG8gIk5vZGUgYWxyZWFkeSBqb2luZWQuIE5vdGhpbmcgdG8gZG8uIgogIGV4aXQgMApmaQoKIyBFeHBlY3QgUFJPVklERVJfSUQgYW5kIExBQkVMUyB0byBiZSBzZXQ7IGZhaWwgZmFzdCBpZiBub3QuCjogIiR7UFJPVklERVJfSUQ6P25vdCBzZXR9IgogOiAiJHtMQUJFTFM6P25vdCBzZXR9IgoKRVhQRUNURURfSE9TVE5BTUU9IiR7UFJPVklERVJfSUQjIyovfSIKZWNobyAiWzIvNF0gRXhwZWN0ZWQgaG9zdG5hbWU6ICR7RVhQRUNURURfSE9TVE5BTUV9IgoKWyAtZiAvZXRjL2RlZmF1bHQva3ViZWxldCBdIHx8IDogPiAvZXRjL2RlZmF1bHQva3ViZWxldAplY2hvICJLVUJFTEVUX0VYVFJBX0FSR1M9XCItLXByb3ZpZGVyLWlkPSR7UFJPVklERVJfSUR9IC0tbm9kZS1sYWJlbHM9JHtMQUJFTFN9XCIiID4gL2V0Yy9kZWZhdWx0L2t1YmVsZXQKc3lzdGVtY3RsIGRhZW1vbi1yZWV4ZWMKc3lzdGVtY3RsIHJlc3RhcnQga3ViZWxldCB8fCB0cnVlCgplY2hvICJbMy80XSBKb2luaW5nIGNsdXN0ZXIgYXMgJHtFWFBFQ1RFRF9IT1NUTkFNRX0iCmt1YmVhZG0gam9pbiAiJHtNQVNURVJfSVB9OiR7TUFTVEVSX1BPUlR9IiBcCiAgLS10b2tlbiAiJHtKT0lOX1RPS0VOfSIgXAogIC0tZGlzY292ZXJ5LXRva2VuLWNhLWNlcnQtaGFzaCAiJHtKT0lOX0hBU0hfRlVMTH0iIFwKICAtLW5vZGUtbmFtZSAiJHtFWFBFQ1RFRF9IT1NUTkFNRX0iCgplY2hvICJEb25lLiBwcm92aWRlcklEPSR7UFJPVklERVJfSUR9IGxhYmVscz0ke0xBQkVMU30iCg==",
       "taints": [],
       "groups": {
         "asg-name-here": {
@@ -257,48 +251,6 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       serviceAccountName: cluster-autoscaler
-      # Init container that assembles the runtime cluster-config.json by
-      # merging the partial ConfigMap with the startup-env Secret. The merged
-      # file lives only on the merged-config emptyDir, so JOIN_TOKEN /
-      # JOIN_HASH_FULL never appear in any persisted Kubernetes resource.
-      #
-      # Pin the digest in production. The alpine/jq image is community-
-      # maintained on Docker Hub; mirror it internally per your image policy.
-      initContainers:
-      - name: merge-config
-        image: alpine/jq:1.7
-        command: ["sh", "-c"]
-        args:
-          - |
-            set -eu
-            jq -s '.[0] * { startupScriptEnv: .[1] }' \
-              /etc/configmap/cluster-config.partial.json \
-              /etc/secret/startup-env.json \
-              > /merged/cluster-config.json
-        resources:
-          limits:
-            cpu: 50m
-            memory: 64Mi
-          requests:
-            cpu: 10m
-            memory: 16Mi
-        securityContext:
-          allowPrivilegeEscalation: false
-          capabilities:
-            drop:
-            - ALL
-          readOnlyRootFilesystem: true
-          runAsNonRoot: true
-          runAsUser: 65534
-        volumeMounts:
-        - mountPath: /etc/configmap
-          name: partial-config
-          readOnly: true
-        - mountPath: /etc/secret
-          name: startup-env
-          readOnly: true
-        - mountPath: /merged
-          name: merged-config
       containers:
         # Replace <VERSION> with the first cluster-autoscaler release that
         # includes the verdacloud provider (see https://github.com/kubernetes/autoscaler/releases).
@@ -345,6 +297,15 @@ spec:
           value: "https://api.verda.com/v1"
         - name: VERDA_CLUSTER_CONFIG_FILE
           value: "/etc/verdacloud/cluster-config.json"
+        # MASTER_IP / MASTER_PORT / JOIN_TOKEN / JOIN_HASH_FULL arrive here
+        # as env vars from the cluster-autoscaler-startup-env Secret. The
+        # autoscaler reads them at startup and prepends `export VAR=...`
+        # lines onto every operator startupScript before sending it to
+        # Verda's CreateStartupScript API. Operators can use any subset
+        # of them as $VAR references in their bash.
+        envFrom:
+        - secretRef:
+            name: cluster-autoscaler-startup-env
         livenessProbe:
           failureThreshold: 3
           httpGet:
@@ -377,29 +338,17 @@ spec:
         - mountPath: /etc/ssl/certs/ca-certificates.crt
           name: ssl-certs
           readOnly: true
-        # The autoscaler reads cluster-config.json from this path (matches
-        # both --cloud-config and VERDA_CLUSTER_CONFIG_FILE). The merged-config
-        # volume is an emptyDir populated by the merge-config InitContainer.
         - mountPath: /etc/verdacloud
-          name: merged-config
+          name: verdacloud-config
           readOnly: true
       volumes:
       - hostPath:
           path: /etc/ssl/certs/ca-certificates.crt
           type: File
         name: ssl-certs
-      # ConfigMap with the partial config (everything except startupScriptEnv).
       - configMap:
           name: verdacloud-cluster-config
-        name: partial-config
-      # Secret with the four sensitive startup-env values.
-      - secret:
-          secretName: cluster-autoscaler-startup-env
-        name: startup-env
-      # Ephemeral volume the InitContainer writes the merged config into and
-      # the autoscaler container reads. Lives only in pod memory/disk.
-      - emptyDir: {}
-        name: merged-config
+        name: verdacloud-config
       tolerations:
       - effect: NoSchedule
         key: node-role.kubernetes.io/control-plane
