@@ -1801,6 +1801,45 @@ func newTestEnvWithMock(t *testing.T) (*mockDCService, *Asg, *autoScalingGroups)
 	return mock, asg, asgs
 }
 
+// Integration: createStartupScript decodes, renders, and uploads — the
+// rendered output the mock receives must contain substituted template values.
+func TestCreateStartupScript_RendersAndUploads(t *testing.T) {
+	mock, asg, asgs := newTestEnvWithMock(t)
+	asgs.cfg.MasterIP = "10.0.0.10"
+	asgs.cfg.MasterPort = "6443"
+	asgs.cfg.JoinToken = "abcdef.0123456789abcdef"
+	asgs.cfg.JoinHashFull = "sha256:cafebabe"
+
+	body := []byte(`kubeadm join "{{.MasterIP}}:{{.MasterPort}}" --token "{{.JoinToken}}" --discovery-token-ca-cert-hash "{{.JoinHashFull}}"`)
+	nodeCfg := &nodeConfig{StartupScript: base64.StdEncoding.EncodeToString(body)}
+
+	id, err := asgs.createStartupScript(context.Background(), asg, nodeCfg, "verdacloud://FIN-02/host-x")
+	if err != nil {
+		t.Fatalf("createStartupScript: %v", err)
+	}
+	if id != mock.startScriptID {
+		t.Errorf("returned id = %q, want %q", id, mock.startScriptID)
+	}
+	if got := len(mock.createdScripts); got != 1 {
+		t.Fatalf("expected 1 CreateStartScript call, got %d", got)
+	}
+	uploaded := mock.createdScripts[0].Script
+	for _, want := range []string{
+		`kubeadm join "10.0.0.10:6443"`,
+		`--token "abcdef.0123456789abcdef"`,
+		`--discovery-token-ca-cert-hash "sha256:cafebabe"`,
+	} {
+		if !strings.Contains(uploaded, want) {
+			t.Errorf("rendered script missing %q\n--- uploaded ---\n%s", want, uploaded)
+		}
+	}
+	for _, leftover := range []string{`{{.MasterIP}}`, `{{.JoinToken}}`} {
+		if strings.Contains(uploaded, leftover) {
+			t.Errorf("template placeholder %q leaked into uploaded script", leftover)
+		}
+	}
+}
+
 func TestRegenerate_FullFlow(t *testing.T) {
 	t.Run("startup with no instances", func(t *testing.T) {
 		mock, asg, asgs := newTestEnvWithMock(t)

@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 	"text/template"
+	"text/template/parse"
 )
 
 // asgSpecNameRe enforces a DNS-label-ish format for ASG names and hostname prefixes.
@@ -103,41 +104,18 @@ func extractAsgNameFromHostname(hostname string) (string, error) {
 	return "", fmt.Errorf("hostname does not contain magic separator '%s': %s", separator, hostname)
 }
 
-// StartupScriptTemplateData defines the *complete* set of variables the
-// operator's startupScript may reference via Go text/template syntax.
-//
-// Adding a field here is a deliberate Go-code change reviewed in PR.
-// Operators cannot extend this set — the script body must work with what
-// is exposed here, or template execution fails fast (we set
-// Option("missingkey=error") on the template).
-//
-// Per-VM identity (provider-id, labels) is intentionally NOT in this
-// struct. verdacloud-cloud-controller-manager patches spec.providerID and
-// the standard topology / instance-type labels onto each Node post-join;
-// the script does not need to know its providerID in advance because
-// kubelet starts with --cloud-provider=external.
-//
-// Pattern reference: this mirrors equinixmetal/manager_rest.go's
-// CloudInitTemplateData (BootstrapTokenID / BootstrapTokenSecret /
-// APIServerEndpoint / NodeGroup) and cherryservers' equivalent.
+// StartupScriptTemplateData is the only text/template root for startupScript; extending it is a code change, not operator config.
+// Per-node identity arrives from CCM after join; unknown template keys fail scale-up via missingkey=error.
 type StartupScriptTemplateData struct {
-	// Cluster-wide; sourced from the cluster-autoscaler-startup-env Secret
-	// via envFrom on the autoscaler container.
+	// Filled from process env on the autoscaler Pod (typically envFrom Secret), not cloud-config.
 	MasterIP     string
 	MasterPort   string
 	JoinToken    string
 	JoinHashFull string
 }
 
-// renderStartupScript executes the operator's startupScript template against
-// the cluster-wide values and returns the bytes to send to Verda's
-// CreateStartupScript API.
-//
-// Failure modes (caught at scale-up time, before any VM is created):
-//   - parse error: operator's template has invalid Go-template syntax.
-//   - missing-key error: operator referenced {{.NotInStruct}} that doesn't
-//     exist on StartupScriptTemplateData. Typo detection.
-//   - execute error: anything else surfaced by template.Execute.
+// renderStartupScript expands operator startupScript templates into bytes for Verda startup-script creation.
+// Template parse errors and missing/unset keys fail during scale-up before any VM exists (missingkey=error).
 func renderStartupScript(operatorBody []byte, vars StartupScriptTemplateData) ([]byte, error) {
 	tmpl, err := template.New("startupScript").
 		Option("missingkey=error").
@@ -151,4 +129,69 @@ func renderStartupScript(operatorBody []byte, vars StartupScriptTemplateData) ([
 		return nil, fmt.Errorf("execute startupScript template: %w", err)
 	}
 	return out.Bytes(), nil
+}
+
+// referencedTemplateFields returns the set of top-level field names
+// referenced via {{.FieldName}} in the operator's startupScript template.
+// Used at startup to catch the empty-Secret-value case that missingkey=error
+// can't (the field is present on the struct but its value is empty).
+func referencedTemplateFields(operatorBody []byte) (map[string]bool, error) {
+	tmpl, err := template.New("startupScript").
+		Option("missingkey=error").
+		Parse(string(operatorBody))
+	if err != nil {
+		return nil, fmt.Errorf("parse startupScript template: %w", err)
+	}
+	fields := make(map[string]bool)
+	if tmpl.Tree != nil {
+		visitTemplateNode(tmpl.Tree.Root, fields)
+	}
+	return fields, nil
+}
+
+// visitTemplateNode recursively collects top-level field names from a parse.Node.
+func visitTemplateNode(node parse.Node, fields map[string]bool) {
+	if node == nil {
+		return
+	}
+	switch n := node.(type) {
+	case *parse.ListNode:
+		if n == nil {
+			return
+		}
+		for _, child := range n.Nodes {
+			visitTemplateNode(child, fields)
+		}
+	case *parse.ActionNode:
+		visitTemplatePipe(n.Pipe, fields)
+	case *parse.IfNode:
+		visitTemplatePipe(n.Pipe, fields)
+		visitTemplateNode(n.List, fields)
+		visitTemplateNode(n.ElseList, fields)
+	case *parse.RangeNode:
+		visitTemplatePipe(n.Pipe, fields)
+		visitTemplateNode(n.List, fields)
+		visitTemplateNode(n.ElseList, fields)
+	case *parse.WithNode:
+		visitTemplatePipe(n.Pipe, fields)
+		visitTemplateNode(n.List, fields)
+		visitTemplateNode(n.ElseList, fields)
+	}
+}
+
+// visitTemplatePipe extracts top-level field names from a pipe's commands.
+// {{.MasterIP}} contributes "MasterIP"; {{.X.Y}} contributes "X".
+func visitTemplatePipe(pipe *parse.PipeNode, fields map[string]bool) {
+	if pipe == nil {
+		return
+	}
+	for _, cmd := range pipe.Cmds {
+		for _, arg := range cmd.Args {
+			if field, ok := arg.(*parse.FieldNode); ok {
+				if len(field.Ident) > 0 {
+					fields[field.Ident[0]] = true
+				}
+			}
+		}
+	}
 }

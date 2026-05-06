@@ -779,26 +779,8 @@ func (m *autoScalingGroups) createInstanceForAsg(ctx context.Context, asg *Asg, 
 	return instance.ID, hostname, nil
 }
 
-// Generates/provisions the startup script for a new instance.
-//
-// Decodes the operator's base64-encoded startupScript, executes it as a
-// Go text/template against the cluster-wide values populated from env vars
-// (see createVerdacloudManager), and uploads the rendered bytes to Verda's
-// CreateStartupScript API. Pattern mirrors equinixmetal/cherryservers
-// providers.
-//
-// Variables exposed: MasterIP, MasterPort, JoinToken, JoinHashFull. Per-VM
-// identity (provider-id, labels) is intentionally NOT exposed —
-// verdacloud-cloud-controller-manager owns those post-join.
-//
-// Failure modes (caught at scale-up before any VM is created): operator's
-// template has bad syntax (parse error) or references a variable not on
-// StartupScriptTemplateData (missing-key error). See
-// verdacloud_startup_render.go for the renderer.
-//
-// providerID is still computed by the caller because it remains the
-// hostname-derivation key the autoscaler uses for instance lookups; it is
-// no longer threaded into the script.
+// createStartupScript decodes the cloud-config startup script, renders it with env-backed template data, and uploads to Verda.
+// providerID is unused—the caller derives hostnames/cache keys independently and CCM supplies per-node identity after join.
 func (m *autoScalingGroups) createStartupScript(ctx context.Context, asg *Asg, nodeConfig *nodeConfig, _ string) (string, error) {
 	scriptName := fmt.Sprintf("as-%s", asg.Name)
 	decodedScript, err := base64.StdEncoding.DecodeString(nodeConfig.StartupScript)
