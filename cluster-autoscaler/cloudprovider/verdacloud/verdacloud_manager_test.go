@@ -18,7 +18,9 @@ package verdacloud
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -312,5 +314,79 @@ func TestGetAvailableGPUTypes(t *testing.T) {
 	// CPU types should be filtered out
 	if _, ok := gpuTypes["CPU.4V.16G"]; ok {
 		t.Error("CPU type should be filtered out")
+	}
+}
+
+// validateStartupTemplateValues guards the empty-Secret-value gap that
+// missingkey=error doesn't catch.
+
+func TestValidateStartupTemplateValues_AllReferencedAndPopulated(t *testing.T) {
+	body := []byte(`kubeadm join "{{.MasterIP}}:{{.MasterPort}}" --token "{{.JoinToken}}" --discovery-token-ca-cert-hash "{{.JoinHashFull}}"`)
+	cfg := &cloudConfig{
+		StartupScript: base64.StdEncoding.EncodeToString(body),
+		MasterIP:      "10.0.0.10",
+		MasterPort:    "6443",
+		JoinToken:     "abcdef.0123456789abcdef",
+		JoinHashFull:  "sha256:1234",
+	}
+	if err := validateStartupTemplateValues(cfg); err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+}
+
+func TestValidateStartupTemplateValues_ReferencedButEmpty(t *testing.T) {
+	body := []byte(`kubeadm join "{{.MasterIP}}:{{.MasterPort}}" --token "{{.JoinToken}}"`)
+	cfg := &cloudConfig{
+		StartupScript: base64.StdEncoding.EncodeToString(body),
+		MasterIP:      "10.0.0.10",
+		MasterPort:    "", // referenced + empty: must error
+		JoinToken:     "", // referenced + empty: must error
+	}
+	err := validateStartupTemplateValues(cfg)
+	if err == nil {
+		t.Fatal("expected error for empty referenced fields, got nil")
+	}
+	for _, want := range []string{"MASTER_PORT", "JOIN_TOKEN"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error should name %q; got: %v", want, err)
+		}
+	}
+	if strings.Contains(err.Error(), "MASTER_IP") {
+		t.Errorf("MASTER_IP is populated; should NOT be in the error: %v", err)
+	}
+	if strings.Contains(err.Error(), "JOIN_HASH_FULL") {
+		t.Errorf("JOIN_HASH_FULL is not referenced by the template; should NOT be in the error: %v", err)
+	}
+}
+
+func TestValidateStartupTemplateValues_NotReferencedAllowsEmpty(t *testing.T) {
+	// Operator's template uses only MasterIP; the other 3 env vars can be empty
+	// because the script never substitutes them.
+	body := []byte(`echo "joining {{.MasterIP}}"`)
+	cfg := &cloudConfig{
+		StartupScript: base64.StdEncoding.EncodeToString(body),
+		MasterIP:      "10.0.0.10",
+		// MasterPort, JoinToken, JoinHashFull intentionally empty
+	}
+	if err := validateStartupTemplateValues(cfg); err != nil {
+		t.Fatalf("expected no error when empty fields are not referenced; got %v", err)
+	}
+}
+
+func TestValidateStartupTemplateValues_BadBase64(t *testing.T) {
+	cfg := &cloudConfig{StartupScript: "not-valid-base64!!!"}
+	if err := validateStartupTemplateValues(cfg); err == nil {
+		t.Fatal("expected base64 decode error, got nil")
+	}
+}
+
+func TestValidateStartupTemplateValues_BadTemplateSyntax(t *testing.T) {
+	body := []byte(`kubeadm join "{{.MasterIP"`) // unbalanced
+	cfg := &cloudConfig{
+		StartupScript: base64.StdEncoding.EncodeToString(body),
+		MasterIP:      "10.0.0.10",
+	}
+	if err := validateStartupTemplateValues(cfg); err == nil {
+		t.Fatal("expected template parse error, got nil")
 	}
 }
