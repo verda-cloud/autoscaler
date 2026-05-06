@@ -18,6 +18,7 @@ package verdacloud
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -86,15 +87,18 @@ func createVerdacloudManager(cloudReader io.Reader, discoveryOpts cloudprovider.
 
 	cfg = verifyCloudConfigAndPatch(cfg)
 
-	// Cluster-wide template values come from env vars on the autoscaler
-	// container (envFrom: secretRef: cluster-autoscaler-startup-env on the
-	// Deployment), never from cluster-config.json. Empty values are accepted;
-	// the operator's startup-script template enforces presence via
-	// `Option("missingkey=error")` semantics — see verdacloud_startup_render.go.
+	// Join/bootstrap template vars (MASTER_IP, MASTER_PORT, JOIN_TOKEN, JOIN_HASH_FULL) load from autoscaler Pod env only, not cloud-config.
 	cfg.MasterIP = os.Getenv("MASTER_IP")
 	cfg.MasterPort = os.Getenv("MASTER_PORT")
 	cfg.JoinToken = os.Getenv("JOIN_TOKEN")
 	cfg.JoinHashFull = os.Getenv("JOIN_HASH_FULL")
+
+	// Fail fast if the operator's startupScript references a {{.X}} whose
+	// corresponding env-var-supplied value is empty (missingkey=error
+	// catches absent fields, not present-but-empty values).
+	if err := validateStartupTemplateValues(cfg); err != nil {
+		return nil, err
+	}
 
 	sdkProvider, err := createVerdacloudSDKProvider(cfg)
 	if err != nil {
@@ -231,6 +235,48 @@ func verifyCloudConfigAndPatch(cfg *cloudConfig) *cloudConfig {
 		cfg.BillingConfig.Price = "FIXED_PRICE"
 	}
 	return cfg
+}
+
+// validateStartupTemplateValues errors if any template field referenced by
+// cfg.StartupScript has an empty value on cfg. Closes the empty-Secret-value
+// gap that missingkey=error doesn't detect.
+func validateStartupTemplateValues(cfg *cloudConfig) error {
+	if cfg.StartupScript == "" {
+		// cfg.isValid() already requires startupScript; defensive check only.
+		return nil
+	}
+	decoded, err := base64.StdEncoding.DecodeString(cfg.StartupScript)
+	if err != nil {
+		return fmt.Errorf("base64-decode startupScript: %w", err)
+	}
+	refs, err := referencedTemplateFields(decoded)
+	if err != nil {
+		return err
+	}
+
+	type fieldCheck struct {
+		name, envVar, value string
+	}
+	checks := []fieldCheck{
+		{"MasterIP", "MASTER_IP", cfg.MasterIP},
+		{"MasterPort", "MASTER_PORT", cfg.MasterPort},
+		{"JoinToken", "JOIN_TOKEN", cfg.JoinToken},
+		{"JoinHashFull", "JOIN_HASH_FULL", cfg.JoinHashFull},
+	}
+	var missing []string
+	for _, c := range checks {
+		if refs[c.name] && c.value == "" {
+			missing = append(missing, c.envVar)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf(
+			"startupScript references template variables but the corresponding env vars are empty: %s. "+
+				"Populate them in the cluster-autoscaler-startup-env Secret and rolling-restart the autoscaler",
+			strings.Join(missing, ", "),
+		)
+	}
+	return nil
 }
 
 // GetAvailableMachineTypes returns a list of available machine types.

@@ -54,8 +54,10 @@ type mockDCService struct {
 	availLocationErr error
 
 	// CreateStartScript controls.
-	startScriptID  string
-	startScriptErr error
+	startScriptID     string
+	startScriptErr    error
+	createdScripts    []verda.CreateStartupScriptRequest // recorded uploads
+	deletedScriptIDs  []string                           // recorded deletions
 
 	// ListInstanceTypes / GetInstanceTypeDetails controls.
 	instanceTypes       []string
@@ -168,19 +170,24 @@ func (m *mockDCService) GetInstanceAvailabilityLocation(_ context.Context, _ str
 	return m.availLocation, m.availLocationErr
 }
 
-func (m *mockDCService) CreateStartScript(_ context.Context, name, _ string) (*verda.StartupScript, error) {
+func (m *mockDCService) CreateStartScript(_ context.Context, name, script string) (*verda.StartupScript, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.startScriptErr != nil {
 		return nil, m.startScriptErr
 	}
+	// Record the rendered script so tests can assert what reached the API.
+	m.createdScripts = append(m.createdScripts, verda.CreateStartupScriptRequest{Name: name, Script: script})
 	return &verda.StartupScript{
 		ID:   m.startScriptID,
 		Name: name,
 	}, nil
 }
 
-func (m *mockDCService) DeleteStartScript(_ context.Context, _ string) error {
+func (m *mockDCService) DeleteStartScript(_ context.Context, id string) error {
+	m.mu.Lock()
+	m.deletedScriptIDs = append(m.deletedScriptIDs, id)
+	m.mu.Unlock()
 	return nil
 }
 
