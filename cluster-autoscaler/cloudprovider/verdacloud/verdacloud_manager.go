@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -84,6 +85,16 @@ func createVerdacloudManager(cloudReader io.Reader, discoveryOpts cloudprovider.
 	}
 
 	cfg = verifyCloudConfigAndPatch(cfg)
+
+	// Cluster-wide startup-script env values are sourced from env vars
+	// populated by `envFrom: secretRef: cluster-autoscaler-startup-env` on
+	// the autoscaler container — NOT from the cluster-config.json file.
+	// Empty values are accepted; the operator's startup script is responsible
+	// for fail-fast (e.g. `set -u` or `${MASTER_IP:?required}`).
+	cfg.MasterIP = os.Getenv("MASTER_IP")
+	cfg.MasterPort = os.Getenv("MASTER_PORT")
+	cfg.JoinToken = os.Getenv("JOIN_TOKEN")
+	cfg.JoinHashFull = os.Getenv("JOIN_HASH_FULL")
 
 	sdkProvider, err := createVerdacloudSDKProvider(cfg)
 	if err != nil {
