@@ -17,27 +17,16 @@ limitations under the License.
 package verdacloud
 
 import (
+	"bytes"
 	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
+	"text/template"
 )
 
 // asgSpecNameRe enforces a DNS-label-ish format for ASG names and hostname prefixes.
 var asgSpecNameRe = regexp.MustCompile(`^[a-z0-9A-Z]+[a-z0-9A-Z\-\.\_]*[a-z0-9A-Z]+$|^[a-z0-9A-Z]{1}$`)
-
-func convertConfigLabelsToK8sLabels(labels []string, asg *Asg) string {
-	if asg == nil {
-		return ""
-	}
-	result := make([]string, 0, len(labels)+2)
-	result = append(result, labels...)
-	result = append(result, fmt.Sprintf("%s=%s", NodeGroupLabelKey, asg.Name))
-	if isGPUInstanceType(asg.instanceType) {
-		result = append(result, fmt.Sprintf("%s=%s", AcceleratorLabel, asg.instanceType))
-	}
-	return strings.Join(result, ",")
-}
 
 func parseAsgSpec(spec string) (*VerdacloudAsgSpec, error) {
 	parts := strings.Split(spec, ":")
@@ -112,4 +101,54 @@ func extractAsgNameFromHostname(hostname string) (string, error) {
 	}
 
 	return "", fmt.Errorf("hostname does not contain magic separator '%s': %s", separator, hostname)
+}
+
+// StartupScriptTemplateData defines the *complete* set of variables the
+// operator's startupScript may reference via Go text/template syntax.
+//
+// Adding a field here is a deliberate Go-code change reviewed in PR.
+// Operators cannot extend this set — the script body must work with what
+// is exposed here, or template execution fails fast (we set
+// Option("missingkey=error") on the template).
+//
+// Per-VM identity (provider-id, labels) is intentionally NOT in this
+// struct. verdacloud-cloud-controller-manager patches spec.providerID and
+// the standard topology / instance-type labels onto each Node post-join;
+// the script does not need to know its providerID in advance because
+// kubelet starts with --cloud-provider=external.
+//
+// Pattern reference: this mirrors equinixmetal/manager_rest.go's
+// CloudInitTemplateData (BootstrapTokenID / BootstrapTokenSecret /
+// APIServerEndpoint / NodeGroup) and cherryservers' equivalent.
+type StartupScriptTemplateData struct {
+	// Cluster-wide; sourced from the cluster-autoscaler-startup-env Secret
+	// via envFrom on the autoscaler container.
+	MasterIP     string
+	MasterPort   string
+	JoinToken    string
+	JoinHashFull string
+}
+
+// renderStartupScript executes the operator's startupScript template against
+// the cluster-wide values and returns the bytes to send to Verda's
+// CreateStartupScript API.
+//
+// Failure modes (caught at scale-up time, before any VM is created):
+//   - parse error: operator's template has invalid Go-template syntax.
+//   - missing-key error: operator referenced {{.NotInStruct}} that doesn't
+//     exist on StartupScriptTemplateData. Typo detection.
+//   - execute error: anything else surfaced by template.Execute.
+func renderStartupScript(operatorBody []byte, vars StartupScriptTemplateData) ([]byte, error) {
+	tmpl, err := template.New("startupScript").
+		Option("missingkey=error").
+		Parse(string(operatorBody))
+	if err != nil {
+		return nil, fmt.Errorf("parse startupScript template: %w", err)
+	}
+
+	var out bytes.Buffer
+	if err := tmpl.Execute(&out, vars); err != nil {
+		return nil, fmt.Errorf("execute startupScript template: %w", err)
+	}
+	return out.Bytes(), nil
 }
