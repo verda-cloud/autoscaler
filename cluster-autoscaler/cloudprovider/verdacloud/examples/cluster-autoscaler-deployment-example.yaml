@@ -148,34 +148,25 @@ stringData:
   client-secret: "your-client-secret"
 
 ---
-# Secret containing the four sensitive cluster-join environment variables.
-# Mounted as env vars on the autoscaler container via `envFrom: secretRef`
-# below. The autoscaler prepends these as `export VAR=...` lines onto the
-# operator's startupScript before sending it to Verda's CreateStartupScript
-# API; the operator's bash reads them via standard $VAR references.
+# ConfigMap containing cluster configuration.
 #
-# In production, source these values from a secret manager (sealed-secrets,
-# External Secrets Operator, Vault, etc.) rather than committing them here.
-apiVersion: v1
-kind: Secret
-metadata:
-  name: cluster-autoscaler-startup-env
-  namespace: cluster-autoscaler
-  labels:
-    app: cluster-autoscaler
-type: Opaque
-stringData:
-  MASTER_IP: ""
-  MASTER_PORT: ""
-  JOIN_TOKEN: ""
-  JOIN_HASH_FULL: ""
-
----
-# ConfigMap containing cluster configuration (non-sensitive only).
-# The four sensitive cluster-join values (MASTER_IP / MASTER_PORT /
-# JOIN_TOKEN / JOIN_HASH_FULL) live in the cluster-autoscaler-startup-env
-# Secret and arrive at the autoscaler as env vars via `envFrom: secretRef`
-# on the Deployment.
+# The autoscaler is a pure pass-through for `startupScript`: the bytes you
+# put here are decoded and uploaded to Verda's CreateStartupScript API
+# verbatim before each VM is created. No env-var injection, no template
+# substitution, no regex rewriting.
+#
+# Implication: anything your script needs (kubeadm join token, master IP,
+# etc.) must come from somewhere YOU control. Common patterns:
+#   - hardcode values in the script body (simplest; values visible in
+#     this ConfigMap and in Verda's StartupScript API);
+#   - have the script fetch them at boot from a discovery endpoint or
+#     metadata service;
+#   - bake them into a per-cluster VM image and source them at boot.
+#
+# Per-VM identity (provider-id, node labels) is set post-join by the
+# verdacloud cloud-controller-manager; the script uses
+# `--cloud-provider=external` and does not need to know its providerID
+# in advance.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -202,8 +193,8 @@ data:
       "reapOrphanNodes": false,
       "reapOrphanNodesAfterCycles": 3,
       "labels": ["env=production"],
-      "_comment_startupScript": "Operator-owned bash. Receives MASTER_IP, MASTER_PORT, JOIN_TOKEN, JOIN_HASH_FULL, PROVIDER_ID, LABELS as exported env vars (autoscaler prepends them). Use $VAR refs and `set -u` (or `${VAR:?required}`) to fail-fast on missing values. Do NOT add `KEY=\"\"` placeholder lines — they would overwrite the autoscaler's exports.",
-      "startupScript": "IyEvdXNyL2Jpbi9lbnYgYmFzaApzZXQgLWV1byBwaXBlZmFpbAoKZWNobyAiWzEvNF0gRmFzdCBleGl0IGlmIGFscmVhZHkgam9pbmVkIgppZiBbIC1mIC9ldGMva3ViZXJuZXRlcy9rdWJlbGV0LmNvbmYgXTsgdGhlbgogIGVjaG8gIk5vZGUgYWxyZWFkeSBqb2luZWQuIE5vdGhpbmcgdG8gZG8uIgogIGV4aXQgMApmaQoKIyBFeHBlY3QgUFJPVklERVJfSUQgYW5kIExBQkVMUyB0byBiZSBzZXQ7IGZhaWwgZmFzdCBpZiBub3QuCjogIiR7UFJPVklERVJfSUQ6P25vdCBzZXR9IgogOiAiJHtMQUJFTFM6P25vdCBzZXR9IgoKRVhQRUNURURfSE9TVE5BTUU9IiR7UFJPVklERVJfSUQjIyovfSIKZWNobyAiWzIvNF0gRXhwZWN0ZWQgaG9zdG5hbWU6ICR7RVhQRUNURURfSE9TVE5BTUV9IgoKWyAtZiAvZXRjL2RlZmF1bHQva3ViZWxldCBdIHx8IDogPiAvZXRjL2RlZmF1bHQva3ViZWxldAplY2hvICJLVUJFTEVUX0VYVFJBX0FSR1M9XCItLXByb3ZpZGVyLWlkPSR7UFJPVklERVJfSUR9IC0tbm9kZS1sYWJlbHM9JHtMQUJFTFN9XCIiID4gL2V0Yy9kZWZhdWx0L2t1YmVsZXQKc3lzdGVtY3RsIGRhZW1vbi1yZWV4ZWMKc3lzdGVtY3RsIHJlc3RhcnQga3ViZWxldCB8fCB0cnVlCgplY2hvICJbMy80XSBKb2luaW5nIGNsdXN0ZXIgYXMgJHtFWFBFQ1RFRF9IT1NUTkFNRX0iCmt1YmVhZG0gam9pbiAiJHtNQVNURVJfSVB9OiR7TUFTVEVSX1BPUlR9IiBcCiAgLS10b2tlbiAiJHtKT0lOX1RPS0VOfSIgXAogIC0tZGlzY292ZXJ5LXRva2VuLWNhLWNlcnQtaGFzaCAiJHtKT0lOX0hBU0hfRlVMTH0iIFwKICAtLW5vZGUtbmFtZSAiJHtFWFBFQ1RFRF9IT1NUTkFNRX0iCgplY2hvICJEb25lLiBwcm92aWRlcklEPSR7UFJPVklERVJfSUR9IGxhYmVscz0ke0xBQkVMU30iCg==",
+      "_comment_startupScript": "Operator-owned bash, sent verbatim to Verda's CreateStartupScript API. Hardcode MASTER_IP/MASTER_PORT/JOIN_TOKEN/JOIN_HASH_FULL OR fetch them at boot from your own discovery mechanism. Per-VM identity (provider-id, labels) is set post-join by verdacloud-cloud-controller-manager via --cloud-provider=external; the script does not need to know its providerID in advance.",
+      "startupScript": "IyEvdXNyL2Jpbi9lbnYgYmFzaApzZXQgLWV1byBwaXBlZmFpbAoKIyMjID09PT09PSBDT05GSUdVUkUgVEhFU0UgPT09PT09ICMjIwojIEhhcmRjb2RlIHZhbHVlcyBPUiBmZXRjaCB0aGVtIGF0IGJvb3QgZnJvbSB5b3VyIG93biBtZWNoYW5pc20uIFRoZQojIGF1dG9zY2FsZXIgZG9lcyBOT1QgaW5qZWN0IGFueXRoaW5nIGludG8gdGhpcyBzY3JpcHQg4oCUIGl0cyBieXRlcyBhcmUgc2VudAojIHZlcmJhdGltIHRvIFZlcmRhJ3MgQ3JlYXRlU3RhcnR1cFNjcmlwdCBBUEkuCk1BU1RFUl9JUD0iIgpNQVNURVJfUE9SVD0iIgpKT0lOX1RPS0VOPSIiCkpPSU5fSEFTSF9GVUxMPSIiCiMjIyA9PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0gIyMjCgo6ICIke01BU1RFUl9JUDo/cmVxdWlyZWR9Igo6ICIke01BU1RFUl9QT1JUOj9yZXF1aXJlZH0iCjogIiR7Sk9JTl9UT0tFTjo/cmVxdWlyZWR9Igo6ICIke0pPSU5fSEFTSF9GVUxMOj9yZXF1aXJlZH0iCgppZiBbIC1mIC9ldGMva3ViZXJuZXRlcy9rdWJlbGV0LmNvbmYgXTsgdGhlbgogIGVjaG8gIk5vZGUgYWxyZWFkeSBqb2luZWQuIgogIGV4aXQgMApmaQoKIyBEZWZlciBwcm92aWRlcklEICsgY2xvdWQgbGFiZWxzIHRvIHZlcmRhY2xvdWQtY2xvdWQtY29udHJvbGxlci1tYW5hZ2VyLgpbIC1mIC9ldGMvZGVmYXVsdC9rdWJlbGV0IF0gfHwgOiA+IC9ldGMvZGVmYXVsdC9rdWJlbGV0CmlmICEgZ3JlcCAtcSAtLSAnLS1jbG91ZC1wcm92aWRlcj1leHRlcm5hbCcgL2V0Yy9kZWZhdWx0L2t1YmVsZXQ7IHRoZW4KICBlY2hvICdLVUJFTEVUX0VYVFJBX0FSR1M9Ii0tY2xvdWQtcHJvdmlkZXI9ZXh0ZXJuYWwiJyA+PiAvZXRjL2RlZmF1bHQva3ViZWxldApmaQpzeXN0ZW1jdGwgZGFlbW9uLXJlZXhlYwpzeXN0ZW1jdGwgcmVzdGFydCBrdWJlbGV0IHx8IHRydWUKCmt1YmVhZG0gam9pbiAiJHtNQVNURVJfSVB9OiR7TUFTVEVSX1BPUlR9IiBcCiAgLS10b2tlbiAiJHtKT0lOX1RPS0VOfSIgXAogIC0tZGlzY292ZXJ5LXRva2VuLWNhLWNlcnQtaGFzaCAiJHtKT0lOX0hBU0hfRlVMTH0iIFwKICAtLW5vZGUtbmFtZSAiJChob3N0bmFtZSkiCgplY2hvICJKb2luZWQuIENDTSB3aWxsIHBvcHVsYXRlIHByb3ZpZGVySUQgKyBsYWJlbHMuIgo=",
       "taints": [],
       "groups": {
         "asg-name-here": {
@@ -297,15 +288,6 @@ spec:
           value: "https://api.verda.com/v1"
         - name: VERDA_CLUSTER_CONFIG_FILE
           value: "/etc/verdacloud/cluster-config.json"
-        # MASTER_IP / MASTER_PORT / JOIN_TOKEN / JOIN_HASH_FULL arrive here
-        # as env vars from the cluster-autoscaler-startup-env Secret. The
-        # autoscaler reads them at startup and prepends `export VAR=...`
-        # lines onto every operator startupScript before sending it to
-        # Verda's CreateStartupScript API. Operators can use any subset
-        # of them as $VAR references in their bash.
-        envFrom:
-        - secretRef:
-            name: cluster-autoscaler-startup-env
         livenessProbe:
           failureThreshold: 3
           httpGet:
