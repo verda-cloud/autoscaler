@@ -41,7 +41,11 @@ rules:
     verbs: ["get", "update"]
   - apiGroups: [""]
     resources: ["nodes"]
-    verbs: ["watch", "list", "get", "update", "delete"]
+    # Note: `delete` is NOT in this verb list. verdacloud-cloud-controller-manager
+    # owns Node deletion when a VM disappears (InstancesV2.InstanceExists returns
+    # false → upstream node-controller deletes the Node). The autoscaler does
+    # not list or delete K8s Nodes.
+    verbs: ["watch", "list", "get", "update"]
   - apiGroups: [""]
     resources:
       - "namespaces"
@@ -213,9 +217,6 @@ data:
       "debug": false,
       "availableLocations": ["FIN-02", "FIN-03"],
       "osVolumeSize": 100,
-      "_comment_reapOrphanNodes": "Optional. Default false. Enable only on clusters without a verdacloud cloud-controller-manager. When true, the autoscaler deletes K8s Nodes whose VMs have disappeared from the API after reapOrphanNodesAfterCycles consecutive Refresh cycles missing (default 3). Once a CCM is deployed, set this back to false.",
-      "reapOrphanNodes": false,
-      "reapOrphanNodesAfterCycles": 3,
       "labels": ["env=production"],
       "_comment_startupScript": "Operator-owned bash, rendered as a Go text/template at scale-up. The autoscaler substitutes {{.MasterIP}}, {{.MasterPort}}, {{.JoinToken}}, {{.JoinHashFull}} from the cluster-autoscaler-startup-env Secret (via envFrom on the autoscaler container). Per-VM identity (provider-id, labels) is set post-join by verdacloud-cloud-controller-manager via --cloud-provider=external; the script does not need to know its providerID in advance. References to other {{.X}} variables fail the template at scale-up with Option(missingkey=error) — typo detection without burning a VM-provision cycle.",
       "startupScript": "IyEvdXNyL2Jpbi9lbnYgYmFzaApzZXQgLWV1byBwaXBlZmFpbAoKaWYgWyAtZiAvZXRjL2t1YmVybmV0ZXMva3ViZWxldC5jb25mIF07IHRoZW4KICBlY2hvICJBbHJlYWR5IGpvaW5lZC4iCiAgZXhpdCAwCmZpCgojIERlZmVyIHByb3ZpZGVySUQgKyBjbG91ZCBsYWJlbHMgdG8gdmVyZGFjbG91ZC1jbG91ZC1jb250cm9sbGVyLW1hbmFnZXIuClsgLWYgL2V0Yy9kZWZhdWx0L2t1YmVsZXQgXSB8fCA6ID4gL2V0Yy9kZWZhdWx0L2t1YmVsZXQKaWYgISBncmVwIC1xIC0tICctLWNsb3VkLXByb3ZpZGVyPWV4dGVybmFsJyAvZXRjL2RlZmF1bHQva3ViZWxldDsgdGhlbgogIGVjaG8gJ0tVQkVMRVRfRVhUUkFfQVJHUz0iLS1jbG91ZC1wcm92aWRlcj1leHRlcm5hbCInID4+IC9ldGMvZGVmYXVsdC9rdWJlbGV0CmZpCnN5c3RlbWN0bCBkYWVtb24tcmVleGVjCnN5c3RlbWN0bCByZXN0YXJ0IGt1YmVsZXQgfHwgdHJ1ZQoKa3ViZWFkbSBqb2luICJ7ey5NYXN0ZXJJUH19Ont7Lk1hc3RlclBvcnR9fSIgXAogIC0tdG9rZW4gInt7LkpvaW5Ub2tlbn19IiBcCiAgLS1kaXNjb3ZlcnktdG9rZW4tY2EtY2VydC1oYXNoICJ7ey5Kb2luSGFzaEZ1bGx9fSIgXAogIC0tbm9kZS1uYW1lICIkKGhvc3RuYW1lKSIKCmVjaG8gIkpvaW5lZC4gQ0NNIHdpbGwgcG9wdWxhdGUgcHJvdmlkZXJJRCArIGxhYmVscy4iCg==",

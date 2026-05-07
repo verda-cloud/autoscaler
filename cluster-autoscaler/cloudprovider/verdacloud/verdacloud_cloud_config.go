@@ -53,14 +53,6 @@ type cloudConfig struct {
 	MasterPort   string `json:"-"`
 	JoinToken    string `json:"-"`
 	JoinHashFull string `json:"-"`
-
-	// ReapOrphanNodes opts into deleting K8s Nodes whose VerdaCloud VMs are
-	// gone. Default false; intended only for clusters without a CCM.
-	ReapOrphanNodes bool `json:"reapOrphanNodes"`
-
-	// ReapOrphanNodesAfterCycles is the consecutive-Refresh-cycles threshold
-	// before a missing hostname's Node is deleted. Default 3 when 0.
-	ReapOrphanNodesAfterCycles int `json:"reapOrphanNodesAfterCycles"`
 }
 
 // GroupConfig overrides global config per-ASG.
