@@ -27,12 +27,8 @@ import (
 
 	"github.com/verda-cloud/verdacloud-sdk-go/pkg/verda"
 	apiv1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/autoscaler/cluster-autoscaler/config"
-	"k8s.io/client-go/kubernetes/fake"
-	k8stesting "k8s.io/client-go/testing"
 )
 
 // Test constants - define magic strings in one place
@@ -67,7 +63,6 @@ func newTestEnv(t *testing.T) (*VerdacloudManager, *Asg, *autoScalingGroups) {
 		asgNodeGroupSpecs: make(map[AsgRef]string),
 		failedInstances:   make(map[string]time.Time),
 		lastFailureCheck:  make(map[AsgRef]time.Time),
-		missingNodeCycles: make(map[string]int),
 	}
 	asgs.registeredAsgs[asg.AsgRef] = asg
 
@@ -1784,7 +1779,6 @@ func newTestEnvWithMock(t *testing.T) (*mockDCService, *Asg, *autoScalingGroups)
 		asgNodeGroupSpecs: make(map[AsgRef]string),
 		failedInstances:   make(map[string]time.Time),
 		lastFailureCheck:  make(map[AsgRef]time.Time),
-		missingNodeCycles: make(map[string]int),
 		cfg:               cfg,
 		dcService:         mock,
 	}
@@ -2525,210 +2519,6 @@ func makeNode(name, providerID string) *apiv1.Node {
 // providerIDFor builds a verdacloud providerID for the given hostname.
 func providerIDFor(hostname string) string {
 	return fmt.Sprintf("%s%s/%s", testProviderPrefix, testLocation, hostname)
-}
-
-func TestSweepOrphanNodes(t *testing.T) {
-	// Hostnames created by our registered ASG
-	aliveHost := fmt.Sprintf("%s-vm-%s-alive01", testHostnamePrefix, strings.ToLower(testLocation))
-	orphanHost := fmt.Sprintf("%s-vm-%s-orphan02", testHostnamePrefix, strings.ToLower(testLocation))
-	// A hostname whose prefix does not match any ASG, e.g. a control-plane VM.
-	foreignHost := fmt.Sprintf("controlplane-vm-%s-cp0001", strings.ToLower(testLocation))
-
-	aliveNode := makeNode("alive-node", providerIDFor(aliveHost))
-	orphanNode := makeNode("orphan-node", providerIDFor(orphanHost))
-	foreignNode := makeNode("cp-node", providerIDFor(foreignHost))
-	noProvIDNode := makeNode("legacy-node", "")
-	nonVerdaNode := makeNode("aws-node", "aws:///us-east-1a/i-abc")
-
-	kubeClient := fake.NewSimpleClientset(
-		aliveNode.DeepCopyObject(),
-		orphanNode.DeepCopyObject(),
-		foreignNode.DeepCopyObject(),
-		noProvIDNode.DeepCopyObject(),
-		nonVerdaNode.DeepCopyObject(),
-	)
-
-	_, _, asgs := newTestEnv(t)
-	asgs.kubeClient = kubeClient
-	asgs.cfg = &cloudConfig{ReapOrphanNodes: true, ReapOrphanNodesAfterCycles: 1}
-
-	apiHostnames := map[string]bool{aliveHost: true}
-
-	asgs.sweepOrphanNodes(context.Background(), apiHostnames)
-
-	remaining, err := kubeClient.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
-	if err != nil {
-		t.Fatalf("list nodes: %v", err)
-	}
-
-	got := make(map[string]bool, len(remaining.Items))
-	for _, n := range remaining.Items {
-		got[n.Name] = true
-	}
-
-	// Orphan should be gone; everything else should survive.
-	if got["orphan-node"] {
-		t.Errorf("expected orphan-node to be deleted, still present")
-	}
-	for _, name := range []string{"alive-node", "cp-node", "legacy-node", "aws-node"} {
-		if !got[name] {
-			t.Errorf("expected %s to remain, was deleted", name)
-		}
-	}
-}
-
-func TestSweepOrphanNodes_NilKubeClient(t *testing.T) {
-	// Without a kubeClient (unit-test path), sweep must be a no-op and not panic.
-	_, _, asgs := newTestEnv(t)
-	asgs.kubeClient = nil
-	asgs.sweepOrphanNodes(context.Background(), map[string]bool{})
-}
-
-func TestSweepOrphanNodes_ToleratesNotFound(t *testing.T) {
-	// Simulate the race where the Node disappears between List and Delete.
-	orphanHost := fmt.Sprintf("%s-vm-%s-orphan02", testHostnamePrefix, strings.ToLower(testLocation))
-	orphanNode := makeNode("orphan-node", providerIDFor(orphanHost))
-
-	kubeClient := fake.NewSimpleClientset(orphanNode.DeepCopyObject())
-	kubeClient.PrependReactor("delete", "nodes", func(_ k8stesting.Action) (bool, runtime.Object, error) {
-		return true, nil, apierrors.NewNotFound(apiv1.Resource("nodes"), "orphan-node")
-	})
-
-	_, _, asgs := newTestEnv(t)
-	asgs.kubeClient = kubeClient
-	asgs.cfg = &cloudConfig{ReapOrphanNodes: true, ReapOrphanNodesAfterCycles: 1}
-
-	// No panic, no error path escapes; this is a best-effort contract.
-	asgs.sweepOrphanNodes(context.Background(), map[string]bool{})
-}
-
-func TestSweepOrphanNodes_DeleteErrorDoesNotAbortLoop(t *testing.T) {
-	// First orphan's delete fails, second orphan's delete must still happen.
-	orphan1Host := fmt.Sprintf("%s-vm-%s-orphan01", testHostnamePrefix, strings.ToLower(testLocation))
-	orphan2Host := fmt.Sprintf("%s-vm-%s-orphan02", testHostnamePrefix, strings.ToLower(testLocation))
-	orphan1 := makeNode("orphan-1", providerIDFor(orphan1Host))
-	orphan2 := makeNode("orphan-2", providerIDFor(orphan2Host))
-
-	kubeClient := fake.NewSimpleClientset(
-		orphan1.DeepCopyObject(),
-		orphan2.DeepCopyObject(),
-	)
-	kubeClient.PrependReactor("delete", "nodes", func(action k8stesting.Action) (bool, runtime.Object, error) {
-		da, ok := action.(k8stesting.DeleteAction)
-		if !ok {
-			return false, nil, nil
-		}
-		if da.GetName() == "orphan-1" {
-			return true, nil, fmt.Errorf("simulated apiserver error")
-		}
-		return false, nil, nil // fall through to default reactor
-	})
-
-	_, _, asgs := newTestEnv(t)
-	asgs.kubeClient = kubeClient
-	asgs.cfg = &cloudConfig{ReapOrphanNodes: true, ReapOrphanNodesAfterCycles: 1}
-
-	asgs.sweepOrphanNodes(context.Background(), map[string]bool{})
-
-	remaining, _ := kubeClient.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
-	names := map[string]bool{}
-	for _, n := range remaining.Items {
-		names[n.Name] = true
-	}
-	if !names["orphan-1"] {
-		t.Errorf("orphan-1 should still exist after simulated delete failure")
-	}
-	if names["orphan-2"] {
-		t.Errorf("orphan-2 should have been deleted even though orphan-1 delete failed")
-	}
-}
-
-func TestSweepOrphanNodes_CycleGating(t *testing.T) {
-	// A managed Node missing from the API for fewer than ReapOrphanNodesAfterCycles
-	// consecutive cycles must NOT be deleted. This guards against deletion based on
-	// a single bad API response. Once the threshold is reached the deletion happens.
-	// If the hostname reappears mid-streak, the counter resets.
-	orphanHost := fmt.Sprintf("%s-vm-%s-orphan02", testHostnamePrefix, strings.ToLower(testLocation))
-	flakyHost := fmt.Sprintf("%s-vm-%s-flaky03", testHostnamePrefix, strings.ToLower(testLocation))
-
-	orphanNode := makeNode("orphan-node", providerIDFor(orphanHost))
-	flakyNode := makeNode("flaky-node", providerIDFor(flakyHost))
-
-	kubeClient := fake.NewSimpleClientset(orphanNode.DeepCopyObject(), flakyNode.DeepCopyObject())
-
-	_, _, asgs := newTestEnv(t)
-	asgs.kubeClient = kubeClient
-	asgs.cfg = &cloudConfig{ReapOrphanNodes: true, ReapOrphanNodesAfterCycles: 3}
-
-	listNames := func() map[string]bool {
-		nodes, _ := kubeClient.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
-		names := make(map[string]bool, len(nodes.Items))
-		for _, n := range nodes.Items {
-			names[n.Name] = true
-		}
-		return names
-	}
-
-	// Cycle 1: both hosts missing. Counter goes to 1, nothing deleted.
-	asgs.sweepOrphanNodes(context.Background(), map[string]bool{})
-	if !listNames()["orphan-node"] || !listNames()["flaky-node"] {
-		t.Fatalf("after cycle 1 nothing should be deleted, got %v", listNames())
-	}
-	if asgs.missingNodeCycles[orphanHost] != 1 || asgs.missingNodeCycles[flakyHost] != 1 {
-		t.Fatalf("expected counters at 1, got orphan=%d flaky=%d",
-			asgs.missingNodeCycles[orphanHost], asgs.missingNodeCycles[flakyHost])
-	}
-
-	// Cycle 2: flakyHost reappears (simulating a transient API blip).
-	// Its counter must reset; orphanHost continues climbing.
-	asgs.sweepOrphanNodes(context.Background(), map[string]bool{flakyHost: true})
-	if !listNames()["orphan-node"] || !listNames()["flaky-node"] {
-		t.Fatalf("after cycle 2 nothing should be deleted, got %v", listNames())
-	}
-	if asgs.missingNodeCycles[orphanHost] != 2 {
-		t.Fatalf("expected orphan counter at 2, got %d", asgs.missingNodeCycles[orphanHost])
-	}
-	if _, present := asgs.missingNodeCycles[flakyHost]; present {
-		t.Fatalf("expected flaky counter cleared after reappearing, got %d", asgs.missingNodeCycles[flakyHost])
-	}
-
-	// Cycle 3: orphanHost still missing; counter hits threshold, deletion happens.
-	// flakyHost is still alive, no change.
-	asgs.sweepOrphanNodes(context.Background(), map[string]bool{flakyHost: true})
-	names := listNames()
-	if names["orphan-node"] {
-		t.Errorf("orphan-node should be deleted at cycle 3 (threshold=3), still present")
-	}
-	if !names["flaky-node"] {
-		t.Errorf("flaky-node should remain (still in API)")
-	}
-	if _, present := asgs.missingNodeCycles[orphanHost]; present {
-		t.Errorf("expected orphan counter cleared after deletion, still %d", asgs.missingNodeCycles[orphanHost])
-	}
-}
-
-func TestSweepOrphanNodes_DisabledByFlag(t *testing.T) {
-	// When ReapOrphanNodes is false, Refresh must skip the sweep entirely.
-	// We exercise the gate that lives in Refresh by simulating its check
-	// directly: with the flag off, sweep is never called and no Node is deleted.
-	orphanHost := fmt.Sprintf("%s-vm-%s-orphan02", testHostnamePrefix, strings.ToLower(testLocation))
-	orphanNode := makeNode("orphan-node", providerIDFor(orphanHost))
-	kubeClient := fake.NewSimpleClientset(orphanNode.DeepCopyObject())
-
-	_, _, asgs := newTestEnv(t)
-	asgs.kubeClient = kubeClient
-	asgs.cfg = &cloudConfig{ReapOrphanNodes: false}
-
-	if asgs.cfg.ReapOrphanNodes {
-		t.Fatal("setup error: flag should be off")
-	}
-	// The Refresh-level guard: callers must check the flag before invoking sweep.
-	// We don't call sweepOrphanNodes here precisely because the flag is off.
-
-	nodes, _ := kubeClient.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
-	if len(nodes.Items) != 1 {
-		t.Fatalf("orphan-node should still exist, got %d nodes", len(nodes.Items))
-	}
 }
 
 func TestBelongsToManagedAsg(t *testing.T) {

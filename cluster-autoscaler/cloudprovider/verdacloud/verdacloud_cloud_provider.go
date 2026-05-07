@@ -188,7 +188,7 @@ func BuildVerdacloud(
 		defer configFile.Close()
 	}
 
-	manager, err := createVerdacloudManager(configFile, do, opts.KubeClient)
+	manager, err := createVerdacloudManager(configFile, do)
 	if err != nil {
 		klog.Fatalf("Failed to create VerdaCloud manager: %v", err)
 	}
