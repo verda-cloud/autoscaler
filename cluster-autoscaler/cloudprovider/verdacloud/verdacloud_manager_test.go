@@ -203,19 +203,19 @@ func TestGetInstancesForAsg(t *testing.T) {
 	}
 
 	// running -> InstanceRunning
-	runningID := verdacloudProviderIDPrefix + "FIN-01/" + fmt.Sprintf("%s-vm-fin-01-00", testHostnamePrefix)
+	runningID := formatProviderID("FIN-01", fmt.Sprintf("%s-vm-fin-01-00", testHostnamePrefix))
 	if s, ok := statusByID[runningID]; !ok || s.State != cloudprovider.InstanceRunning {
 		t.Errorf("running instance should be InstanceRunning, got %v", statusByID[runningID])
 	}
 
 	// provisioning -> InstanceCreating
-	provID := verdacloudProviderIDPrefix + "FIN-01/" + fmt.Sprintf("%s-vm-fin-01-01", testHostnamePrefix)
+	provID := formatProviderID("FIN-01", fmt.Sprintf("%s-vm-fin-01-01", testHostnamePrefix))
 	if s, ok := statusByID[provID]; !ok || s.State != cloudprovider.InstanceCreating {
 		t.Errorf("provisioning instance should be InstanceCreating, got %v", statusByID[provID])
 	}
 
 	// pending -> InstanceCreating
-	pendingID := verdacloudProviderIDPrefix + "FIN-01/" + fmt.Sprintf("%s-vm-fin-01-02", testHostnamePrefix)
+	pendingID := formatProviderID("FIN-01", fmt.Sprintf("%s-vm-fin-01-02", testHostnamePrefix))
 	if s, ok := statusByID[pendingID]; !ok || s.State != cloudprovider.InstanceCreating {
 		t.Errorf("pending instance should be InstanceCreating, got %v", statusByID[pendingID])
 	}
