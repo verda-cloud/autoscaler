@@ -35,7 +35,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
-	kube_client "k8s.io/client-go/kubernetes"
 	klog "k8s.io/klog/v2"
 )
 
@@ -51,7 +50,6 @@ type VerdacloudManager struct {
 	sdkProvider *verdacloudSDKProvider
 	dcService   dcService
 	asgs        *autoScalingGroups
-	kubeClient  kube_client.Interface
 
 	// Unix-nano timestamp of the last successful regenerate.
 	// Atomic keeps concurrent Refresh calls race-free.
@@ -72,7 +70,7 @@ type InstanceResource struct {
 	GPU          int64
 }
 
-func createVerdacloudManager(cloudReader io.Reader, discoveryOpts cloudprovider.NodeGroupDiscoveryOptions, kubeClient kube_client.Interface) (*VerdacloudManager, error) {
+func createVerdacloudManager(cloudReader io.Reader, discoveryOpts cloudprovider.NodeGroupDiscoveryOptions) (*VerdacloudManager, error) {
 	cfg := &cloudConfig{}
 	if cloudReader != nil {
 		decoder := json.NewDecoder(cloudReader)
@@ -111,11 +109,10 @@ func createVerdacloudManager(cloudReader io.Reader, discoveryOpts cloudprovider.
 		cfg:         cfg,
 		sdkProvider: sdkProvider,
 		dcService:   dcService,
-		kubeClient:  kubeClient,
 		asgs:        nil,
 	}
 
-	manager.asgs, err = newAutoScalingGroups(dcService, discoveryOpts.NodeGroupSpecs, cfg, kubeClient)
+	manager.asgs, err = newAutoScalingGroups(dcService, discoveryOpts.NodeGroupSpecs, cfg)
 	if err != nil {
 		return nil, err
 	}
