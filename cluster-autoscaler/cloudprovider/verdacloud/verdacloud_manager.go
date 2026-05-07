@@ -175,7 +175,7 @@ func (m *VerdacloudManager) GetAsgNodes(ctx context.Context, asg *Asg) ([]string
 	}
 	providerIDs := make([]string, 0, len(instances))
 	for _, inst := range instances {
-		providerIDs = append(providerIDs, verdacloudProviderIDPrefix+inst.Location+"/"+inst.Hostname)
+		providerIDs = append(providerIDs, formatProviderID(inst.Location, inst.Hostname))
 	}
 	return providerIDs, nil
 }
@@ -317,7 +317,7 @@ func (m *VerdacloudManager) getInstancesForAsg(ref AsgRef) ([]cloudprovider.Inst
 	}
 	cloudInstances := make([]cloudprovider.Instance, 0, len(asgInstances))
 	for _, asgIns := range asgInstances {
-		providerID := verdacloudProviderIDPrefix + asgIns.Location + "/" + asgIns.Hostname
+		providerID := formatProviderID(asgIns.Location, asgIns.Hostname)
 		status := strings.ToLower(asgIns.Status)
 		switch status {
 		case verda.StatusRunning:
