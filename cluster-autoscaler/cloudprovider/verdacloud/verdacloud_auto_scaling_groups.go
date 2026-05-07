@@ -209,7 +209,7 @@ func (m *autoScalingGroups) regenerate() error {
 		for _, inst := range activeInstances {
 			ref := InstanceRef{
 				Hostname:   inst.Hostname,
-				ProviderID: verdacloudProviderIDPrefix + inst.Location + "/" + inst.Hostname,
+				ProviderID: formatProviderID(inst.Location, inst.Hostname),
 			}
 			newCache.addInstance(ref, asg, inst.ID)
 		}
@@ -681,7 +681,7 @@ func (m *autoScalingGroups) createInstances(ctx context.Context, asg *Asg, nodeC
 			resultsCh <- instanceCreateResult{
 				ref: InstanceRef{
 					Hostname:   hostname,
-					ProviderID: verdacloudProviderIDPrefix + location + "/" + hostname,
+					ProviderID: formatProviderID(location, hostname),
 				},
 				id: instanceID,
 			}
@@ -729,7 +729,7 @@ func (m *autoScalingGroups) createInstanceForAsg(ctx context.Context, asg *Asg, 
 		fmt.Sprintf("%s%s%s-%08x", baseName, ASG_SEPARATOR, strings.ToLower(location), rand.Uint32()),
 		".", "-")
 
-	providerID := fmt.Sprintf("verdacloud://%s/%s", location, hostname)
+	providerID := formatProviderID(location, hostname)
 	klog.V(4).Infof("Creating instance %s with providerID=%s", hostname, providerID)
 
 	startupScriptID, err := m.createStartupScript(ctx, asg, nodeConfig, providerID)

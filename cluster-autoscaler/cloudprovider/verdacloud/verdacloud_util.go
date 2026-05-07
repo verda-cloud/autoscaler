@@ -77,6 +77,13 @@ func isGPUInstanceType(instanceType string) bool {
 	return !strings.HasPrefix(strings.ToUpper(instanceType), "CPU.")
 }
 
+// formatProviderID returns "verdacloud://<lowercase-location>/<hostname>".
+// Location is lowercased to stay byte-equal with what verdacloud-CCM writes
+// onto Node.Spec.ProviderID (CCM normalizes location to lowercase).
+func formatProviderID(location, hostname string) string {
+	return verdacloudProviderIDPrefix + strings.ToLower(location) + "/" + hostname
+}
+
 func instanceRefFromProviderId(providerId string) (*InstanceRef, error) {
 	if !strings.HasPrefix(providerId, verdacloudProviderIDPrefix) {
 		return nil, fmt.Errorf("not a VerdaCloud provider ID: %s", providerId)
