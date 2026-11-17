@@ -26,7 +26,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/verda-cloud/verdacloud-sdk-go/pkg/verda"
+	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/verdacloud/verda-go"
 	klog "k8s.io/klog/v2"
 )
 

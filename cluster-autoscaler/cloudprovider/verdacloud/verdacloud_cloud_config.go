@@ -44,7 +44,6 @@ type cloudConfig struct {
 	SSHKeyIDs          []string               `json:"sshKeyIDs"`
 	BillingConfig      billingConfig          `json:"billingConfig"`
 	Labels             []string               `json:"labels"`
-	Debug              bool                   `json:"debug"`
 	AvailableLocations []string               `json:"availableLocations"`
 	StartupScript      string                 `json:"startupScript"`
 	Taints             []apiv1.Taint          `json:"taints"`

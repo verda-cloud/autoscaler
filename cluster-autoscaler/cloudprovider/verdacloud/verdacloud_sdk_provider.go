@@ -21,7 +21,7 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/verda-cloud/verdacloud-sdk-go/pkg/verda"
+	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/verdacloud/verda-go"
 	klog "k8s.io/klog/v2"
 )
 
@@ -32,7 +32,7 @@ type verdacloudSDKProvider struct {
 	client *verda.Client
 }
 
-func createVerdacloudSDKProvider(cfg *cloudConfig) (*verdacloudSDKProvider, error) {
+func createVerdacloudSDKProvider() (*verdacloudSDKProvider, error) {
 	clientID := os.Getenv("VERDA_CLIENT_ID")
 	clientSecret := os.Getenv("VERDA_CLIENT_SECRET")
 	baseURL := os.Getenv("VERDA_BASE_URL")
@@ -41,21 +41,9 @@ func createVerdacloudSDKProvider(cfg *cloudConfig) (*verdacloudSDKProvider, erro
 		return nil, fmt.Errorf("VERDA_CLIENT_ID and VERDA_CLIENT_SECRET environment variables must be set")
 	}
 
-	verdaDebug := os.Getenv("VERDA_DEBUG")
-	detailedDebugEnabled := verdaDebug == "true" || verdaDebug == "1"
-
-	var logger verda.Logger
-	if cfg.Debug || detailedDebugEnabled {
-		logger = verda.NewStdLogger(true)
-	} else {
-		logger = &verda.NoOpLogger{}
-	}
-
 	clientOpts := []verda.ClientOption{
 		verda.WithClientID(clientID),
 		verda.WithClientSecret(clientSecret),
-		verda.WithDebugLogging(cfg.Debug),
-		verda.WithLogger(logger),
 		verda.WithUserAgent(autoscalerUserAgent),
 		// Backstop for calls whose context carries no deadline; withAPIDeadline is the primary bound.
 		verda.WithHTTPClient(&http.Client{Timeout: apiCallTimeout}),
@@ -72,15 +60,5 @@ func createVerdacloudSDKProvider(cfg *cloudConfig) (*verdacloudSDKProvider, erro
 	if err != nil {
 		return nil, err
 	}
-
-	// No SDK retry middleware: request middleware runs before HTTPClient.Do, so it cannot retry
-	// the HTTP call. Failed calls surface to the autoscaler loop, which retries on its next pass.
-	if detailedDebugEnabled {
-		verda.AddDetailedDebugLogging(client)
-		klog.V(4).Info("VerdaCloud SDK detailed debug logging enabled (VERDA_DEBUG=true)")
-	}
-
-	return &verdacloudSDKProvider{
-		client: client,
-	}, nil
+	return &verdacloudSDKProvider{client: client}, nil
 }

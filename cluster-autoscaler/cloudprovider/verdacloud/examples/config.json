@@ -9,7 +9,6 @@
     "price": "FIXED_PRICE",
     "contract": "PAY_AS_YOU_GO"
   },
-  "debug": false,
   "availableLocations": ["FIN-02", "FIN-03"],
   "osVolumeSize": 100,
   "labels": ["env=production"],

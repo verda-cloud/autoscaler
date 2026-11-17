@@ -27,7 +27,7 @@ import (
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 
-	"github.com/verda-cloud/verdacloud-sdk-go/pkg/verda"
+	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/verdacloud/verda-go"
 )
 
 // newTestManagerWithMock creates a VerdacloudManager backed by a mockDCService.
