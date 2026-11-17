@@ -390,3 +390,81 @@ func TestValidateStartupTemplateValues_BadTemplateSyntax(t *testing.T) {
 		t.Fatal("expected template parse error, got nil")
 	}
 }
+
+func TestBuildNodeFromTemplate_LabelsMatchRealNodes(t *testing.T) {
+	cases := []struct {
+		name         string
+		locations    []string
+		wantLocation string
+	}{
+		{"single location advertises CCM topology labels", []string{"FIN-01"}, "fin-01"},
+		{"multi location advertises none", []string{"FIN-01", "FIN-03"}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, manager := newTestManagerWithMock(t)
+			manager.cfg.Labels = []string{"team=ml"}
+			asg := &Asg{AsgRef: AsgRef{Name: "gpu-pool"}, instanceType: "1H100.80S.22V", AvailabilityLocations: tc.locations}
+			template := &asgTemplate{
+				InstanceType: &InstanceResource{InstanceType: "1H100.80S.22V", Arch: "amd64", CPU: 22, Memory: 1 << 30, GPU: 1},
+				Tags:         map[string]string{},
+			}
+
+			node, err := manager.buildNodeFromTemplate(asg, template)
+			if err != nil {
+				t.Fatalf("buildNodeFromTemplate: %v", err)
+			}
+
+			for k, v := range registeredNodeLabels(asg, manager.cfg.GetNodeConfig(asg.Name)) {
+				if node.Labels[k] != v {
+					t.Errorf("template label %s=%q, real node registers %q", k, node.Labels[k], v)
+				}
+			}
+			for _, absent := range []string{"verda.com/hostname", "topology.kubernetes.io/location"} {
+				if _, ok := node.Labels[absent]; ok {
+					t.Errorf("template carries %s, which no real node has", absent)
+				}
+			}
+			for _, key := range []string{apiv1.LabelTopologyRegion, apiv1.LabelTopologyZone, LabelLocation} {
+				if got := node.Labels[key]; got != tc.wantLocation {
+					t.Errorf("%s = %q, want %q", key, got, tc.wantLocation)
+				}
+			}
+		})
+	}
+}
+
+func TestGetInstancesForAsg_StatusAndProviderID(t *testing.T) {
+	mock, manager := newTestManagerWithMock(t)
+	asg, _ := manager.GetAsgByRef(AsgRef{Name: testAsgName})
+	host := func(i int) string { return fmt.Sprintf("%s-vm-fin-01-%08x", testHostnamePrefix, i) }
+	refs := []InstanceRef{
+		{Hostname: host(1), ProviderID: formatProviderID("FIN-01", host(1))},
+		{Hostname: host(2), ProviderID: formatProviderID("FIN-01", host(2))},
+		{Hostname: host(3), ProviderID: formatProviderID("FIN-01", host(3))}, // not listed yet
+	}
+	manager.asgs.updateCacheWithInstances(asg, toCreateResults(refs))
+	mock.setInstances([]verda.Instance{
+		{ID: "i-1", Hostname: host(1), Location: "FIN-01", Status: verda.StatusOffline},
+		{ID: "i-2", Hostname: host(2), Location: "FIN-01", Status: verda.StatusError},
+	})
+
+	got, err := manager.getInstancesForAsg(asg.AsgRef)
+	if err != nil {
+		t.Fatalf("getInstancesForAsg: %v", err)
+	}
+	byID := make(map[string]cloudprovider.Instance, len(got))
+	for _, inst := range got {
+		byID[inst.Id] = inst
+	}
+
+	if s := byID["verdacloud://fin-01/"+host(1)].Status; s == nil || s.State != cloudprovider.InstanceRunning {
+		t.Errorf("offline VM status = %+v, want InstanceRunning", s)
+	}
+	if s := byID["verdacloud://fin-01/"+host(2)].Status; s == nil || s.State != cloudprovider.InstanceCreating || s.ErrorInfo == nil {
+		t.Errorf("errored VM status = %+v, want InstanceCreating with ErrorInfo", s)
+	}
+	if _, ok := byID["verdacloud://fin-01/"+host(3)]; !ok {
+		t.Errorf("placeholder providerID must match the CCM format; got ids %v", got)
+	}
+}

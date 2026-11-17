@@ -18,21 +18,15 @@ package verdacloud
 
 import (
 	"fmt"
+	"net/http"
 	"os"
-	"time"
 
 	"github.com/verda-cloud/verdacloud-sdk-go/pkg/verda"
 	klog "k8s.io/klog/v2"
 )
 
-const (
-	// Identifies the autoscaler in API requests.
-	autoscalerUserAgent = "cluster-autoscaler/verdacloud"
-
-	// Retry budget for transient SDK failures.
-	sdkMaxRetries     = 3
-	sdkInitialBackoff = time.Second
-)
+// Identifies the autoscaler in API requests.
+const autoscalerUserAgent = "cluster-autoscaler/verdacloud"
 
 type verdacloudSDKProvider struct {
 	client *verda.Client
@@ -63,6 +57,8 @@ func createVerdacloudSDKProvider(cfg *cloudConfig) (*verdacloudSDKProvider, erro
 		verda.WithDebugLogging(cfg.Debug),
 		verda.WithLogger(logger),
 		verda.WithUserAgent(autoscalerUserAgent),
+		// Backstop for calls whose context carries no deadline; withAPIDeadline is the primary bound.
+		verda.WithHTTPClient(&http.Client{Timeout: apiCallTimeout}),
 	}
 
 	if baseURL != "" {
@@ -77,16 +73,12 @@ func createVerdacloudSDKProvider(cfg *cloudConfig) (*verdacloudSDKProvider, erro
 		return nil, err
 	}
 
-	client.AddRequestMiddleware(
-		verda.ExponentialBackoffRetryMiddleware(sdkMaxRetries, sdkInitialBackoff, logger),
-	)
-
+	// No SDK retry middleware: request middleware runs before HTTPClient.Do, so it cannot retry
+	// the HTTP call. Failed calls surface to the autoscaler loop, which retries on its next pass.
 	if detailedDebugEnabled {
 		verda.AddDetailedDebugLogging(client)
 		klog.V(4).Info("VerdaCloud SDK detailed debug logging enabled (VERDA_DEBUG=true)")
 	}
-
-	klog.V(4).Infof("VerdaCloud SDK client created with retry middleware enabled (max %d retries, exponential backoff from %s)", sdkMaxRetries, sdkInitialBackoff)
 
 	return &verdacloudSDKProvider{
 		client: client,

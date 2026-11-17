@@ -39,6 +39,16 @@ const (
 	FAILED_INSTANCE_CLEANUP_AGE       = 10 * time.Minute // Delete stuck failed instances after this age.
 	FAILED_INSTANCE_MAP_ENTRY_TTL     = 1 * time.Hour    // Prevent unbounded map growth.
 	MAX_CONCURRENT_INSTANCE_CREATIONS = 10               // Limit concurrent provider API calls.
+
+	// pendingInstanceGracePeriod is how long a VM we created may be missing from the
+	// instance list (create→list lag) before it is treated as gone.
+	pendingInstanceGracePeriod = 5 * time.Minute
+
+	// maxHostnameAttempts bounds regeneration of a random hostname suffix on collision.
+	maxHostnameAttempts = 5
+
+	// ownershipMarkerPrefix starts the VM Description written by ownershipMarker.
+	ownershipMarkerPrefix = "verda-ca"
 )
 
 // ASG_SEPARATOR is the separator pattern used to parse hostnames.
@@ -63,7 +73,19 @@ type autoScalingGroups struct {
 	failedInstances  map[string]time.Time // Hostname to first failure time.
 	lastFailureCheck map[AsgRef]time.Time // ASG to last observed failed instance time.
 
+	// pendingCreates holds VMs created by this process that the instance list has not shown
+	// yet, keyed by hostname. Entries leave on first sighting or after pendingInstanceGracePeriod.
+	pendingCreates map[string]pendingInstance
+
 	cacheMutex sync.RWMutex // Concurrency - covers all above mutable fields
+}
+
+// pendingInstance is a VM this process created that the API list has not shown yet.
+type pendingInstance struct {
+	ref       InstanceRef
+	asgRef    AsgRef
+	id        string
+	createdAt time.Time
 }
 
 // newAutoScalingGroups validates and registers node group specs.
@@ -76,6 +98,7 @@ func newAutoScalingGroups(dcService dcService, nodeGroupSpecs []string, cfg *clo
 		asgNodeGroupSpecs: make(map[AsgRef]string),
 		failedInstances:   make(map[string]time.Time),
 		lastFailureCheck:  make(map[AsgRef]time.Time),
+		pendingCreates:    make(map[string]pendingInstance),
 		cfg:               cfg,
 		dcService:         dcService,
 	}
@@ -155,43 +178,42 @@ func (m *autoScalingGroups) regenerate() error {
 	}
 
 	// (2) Snapshot current state under read lock. This allows intelligent comparison of cache vs live.
-	existingAsgs, existingAsgToInstances, existingInstanceIDs, asgCurSizes := func() (map[AsgRef]*Asg, map[AsgRef][]InstanceRef, map[InstanceRef]string, map[AsgRef]int) {
+	existingAsgs, existingAsgToInstances, pendingCreates := func() (map[AsgRef]*Asg, map[AsgRef][]InstanceRef, map[string]pendingInstance) {
 		m.cacheMutex.RLock()
 		defer m.cacheMutex.RUnlock()
 		ea := make(map[AsgRef]*Asg, len(m.registeredAsgs))
-		cs := make(map[AsgRef]int, len(m.registeredAsgs))
 		for ref, asg := range m.registeredAsgs {
 			ea[ref] = asg
-			cs[ref] = asg.curSize
 		}
 		eai := make(map[AsgRef][]InstanceRef, len(m.asgToInstances))
 		for ref, instances := range m.asgToInstances {
 			eai[ref] = append([]InstanceRef(nil), instances...)
 		}
-		eids := make(map[InstanceRef]string, len(m.instanceIDs))
-		for ref, id := range m.instanceIDs {
-			eids[ref] = id
+		pc := make(map[string]pendingInstance, len(m.pendingCreates))
+		for hostname, p := range m.pendingCreates {
+			pc[hostname] = p
 		}
-		return ea, eai, eids, cs
+		return ea, eai, pc
 	}()
 
 	// (3) Produce new cache sets based on API state. Track failed instances per ASG for later bookkeeping.
+	now := time.Now()
 	newCache := &instanceMaps{
 		instanceToAsg:  make(map[InstanceRef]*Asg),
 		asgToInstances: make(map[AsgRef][]InstanceRef),
 		instanceIDs:    make(map[InstanceRef]string),
 	}
 	allFailedInstances := make(map[AsgRef][]verda.Instance)
-
-	oldCache := &instanceMaps{
-		asgToInstances: existingAsgToInstances,
-		instanceIDs:    existingInstanceIDs,
-	}
+	droppedByAsg := make(map[AsgRef]int)
+	allSeenHostnames := make(map[string]bool)
 
 	// Sweep each ASG, record active & failed, and assign to new cache.
 	for _, asg := range existingAsgs {
 		activeInstances, failedInstances, apiSeenHostnames := m.categorizeInstancesForAsg(allInstances, asg)
 		allFailedInstances[asg.AsgRef] = failedInstances
+		for hostname := range apiSeenHostnames {
+			allSeenHostnames[hostname] = true
+		}
 
 		// Add active to cache
 		for _, inst := range activeInstances {
@@ -202,8 +224,9 @@ func (m *autoScalingGroups) regenerate() error {
 			newCache.addInstance(ref, asg, inst.ID)
 		}
 
-		// Carry over provisioning instances not yet visible in the API.
-		m.preserveCachedInstances(asg, asgCurSizes[asg.AsgRef], apiSeenHostnames, oldCache, newCache)
+		// Carry over instances we created that the API does not list yet.
+		preservePendingInstances(asg, apiSeenHostnames, pendingCreates, now, newCache)
+		droppedByAsg[asg.AsgRef] = countDroppedMembers(existingAsgToInstances[asg.AsgRef], failedInstances, newCache)
 	}
 
 	// (4) Atomically install new cache and reconcile curSize according to observed state
@@ -211,7 +234,8 @@ func (m *autoScalingGroups) regenerate() error {
 	m.instanceToAsg = newCache.instanceToAsg
 	m.asgToInstances = newCache.asgToInstances
 	m.instanceIDs = newCache.instanceIDs
-	m.reconcileCurSize(newCache.asgToInstances, allFailedInstances)
+	m.prunePendingCreates(allSeenHostnames, now)
+	m.reconcileCurSize(newCache.asgToInstances, allFailedInstances, droppedByAsg)
 	m.cacheMutex.Unlock()
 
 	// (5) Process failed/provisioning-failed instances: update backoff tracking & cleanup stuck ones.
@@ -220,38 +244,25 @@ func (m *autoScalingGroups) regenerate() error {
 	return nil
 }
 
-// belongsToManagedAsg returns true when the hostname matches an ASG we manage.
-// Keep this matching rule in sync with categorizeInstancesForAsg.
-func (m *autoScalingGroups) belongsToManagedAsg(hostname string) bool {
-	prefix, err := extractAsgNameFromHostname(hostname)
-	if err != nil {
-		return false
-	}
-	m.cacheMutex.RLock()
-	defer m.cacheMutex.RUnlock()
-	for _, asg := range m.registeredAsgs {
-		matchKey := asg.hostnamePrefix
-		if matchKey == "" {
-			matchKey = asg.Name
-		}
-		if strings.EqualFold(prefix, matchKey) {
-			return true
-		}
-	}
-	return false
-}
-
 // Reconcilation routine: Bumps curSize within each ASG.
 // Rule: If more active seen than curSize, adopt them as real (manual creation).
 //
+//	Members that vanished or reached a non-member status shrink curSize (never below active).
 //	If fewer and there are failures, drop curSize to match active.
 //	Otherwise, maintain optimism as provisioning can be delayed.
 //
 // Must be called with cacheMutex held!
-func (m *autoScalingGroups) reconcileCurSize(asgToInstances map[AsgRef][]InstanceRef, failedByAsg map[AsgRef][]verda.Instance) {
+func (m *autoScalingGroups) reconcileCurSize(asgToInstances map[AsgRef][]InstanceRef, failedByAsg map[AsgRef][]verda.Instance, droppedByAsg map[AsgRef]int) {
 	for ref, asg := range m.registeredAsgs {
 		activeCount := len(asgToInstances[ref])
 		failedCount := len(failedByAsg[ref])
+
+		if dropped := droppedByAsg[ref]; dropped > 0 && asg.curSize > activeCount {
+			newSize := max(asg.curSize-dropped, activeCount)
+			klog.Warningf("ASG %s curSize: %d -> %d (%d members no longer listed as active)",
+				asg.Name, asg.curSize, newSize, dropped)
+			asg.curSize = newSize
+		}
 
 		if activeCount > asg.curSize {
 			klog.V(4).Infof("ASG %s curSize: %d -> %d (active instances increased)",
@@ -283,6 +294,7 @@ func (c *instanceMaps) addInstance(ref InstanceRef, asg *Asg, instanceID string)
 
 // Categorize all API instances by active/failed for this ASG only.
 // Returns also full list of matching hostnames observed in live API for this ASG.
+// Only VMs this cluster owns (see ownsInstance) are considered.
 func (m *autoScalingGroups) categorizeInstancesForAsg(allInstances []verda.Instance, asg *Asg) (active, failed []verda.Instance, seenHostnames map[string]bool) {
 	matchKey := asg.hostnamePrefix
 	if matchKey == "" {
@@ -295,6 +307,11 @@ func (m *autoScalingGroups) categorizeInstancesForAsg(allInstances []verda.Insta
 		if err != nil || !strings.EqualFold(prefix, matchKey) {
 			continue
 		}
+		if !m.ownsInstance(inst, asg) {
+			klog.V(4).Infof("Skipping instance %s: description %q does not mark it as owned by cluster %q",
+				inst.Hostname, inst.Description, m.cfg.ClusterName)
+			continue
+		}
 		seenHostnames[inst.Hostname] = true
 		if isActiveStatus(inst.Status) {
 			active = append(active, inst)
@@ -305,26 +322,89 @@ func (m *autoScalingGroups) categorizeInstancesForAsg(allInstances []verda.Insta
 	return
 }
 
-// Preserve those instances that are in the local cache but have not yet appeared in the API (e.g., still provisioning).
-// Ensures we don't "forget" in-flight nodes.
-func (m *autoScalingGroups) preserveCachedInstances(
-	asg *Asg,
-	snapshotCurSize int,
-	apiSeenHostnames map[string]bool,
-	old *instanceMaps,
-	new *instanceMaps,
-) {
-	if len(new.asgToInstances[asg.AsgRef]) >= snapshotCurSize {
-		return
+// ownershipMarker is the VM Description identifying the owning cluster and group.
+func ownershipMarker(clusterName, asgName string) string {
+	return fmt.Sprintf("%s cluster=%s group=%s", ownershipMarkerPrefix, clusterName, asgName)
+}
+
+// parseOwnershipMarker extracts the cluster from a Description written by ownershipMarker.
+func parseOwnershipMarker(description string) (cluster string, ok bool) {
+	fields := strings.Fields(description)
+	if len(fields) == 0 || fields[0] != ownershipMarkerPrefix {
+		return "", false
 	}
-	// Try to restore as many as to match curSize, but skip any now visible in API.
-	for _, existingRef := range old.asgToInstances[asg.AsgRef] {
-		if len(new.asgToInstances[asg.AsgRef]) >= snapshotCurSize {
-			break
+	for _, field := range fields[1:] {
+		if value, found := strings.CutPrefix(field, "cluster="); found {
+			return value, true
 		}
-		if !apiSeenHostnames[existingRef.Hostname] {
-			id := old.instanceIDs[existingRef]
-			new.addInstance(existingRef, asg, id)
+	}
+	return "", false
+}
+
+// ownsInstance: a marked VM must name this cluster; an unmarked VM is legacy and adopted only when
+// its Description is empty or the group name (what earlier versions wrote).
+func (m *autoScalingGroups) ownsInstance(inst verda.Instance, asg *Asg) bool {
+	if cluster, marked := parseOwnershipMarker(inst.Description); marked {
+		return cluster == m.cfg.ClusterName
+	}
+	return inst.Description == "" || inst.Description == asg.Name
+}
+
+// preservePendingInstances keeps VMs we created within pendingInstanceGracePeriod that the
+// API does not list yet, so in-flight nodes are not forgotten. Anything else missing from a
+// successful list is gone and is not carried over.
+func preservePendingInstances(asg *Asg, apiSeenHostnames map[string]bool, pending map[string]pendingInstance, now time.Time, new *instanceMaps) {
+	for hostname, p := range pending {
+		if p.asgRef != asg.AsgRef || apiSeenHostnames[hostname] {
+			continue
+		}
+		if now.Sub(p.createdAt) > pendingInstanceGracePeriod {
+			klog.Warningf("ASG %s: instance %s (id=%s) not listed %v after creation; treating as gone",
+				asg.Name, hostname, p.id, pendingInstanceGracePeriod)
+			continue
+		}
+		if _, exists := new.instanceToAsg[p.ref]; !exists {
+			new.addInstance(p.ref, asg, p.id)
+		}
+	}
+}
+
+// countDroppedMembers counts previous members absent from the new cache, excluding failed
+// instances (reconcileCurSize accounts for those separately).
+func countDroppedMembers(previous []InstanceRef, failed []verda.Instance, new *instanceMaps) int {
+	failedHostnames := make(map[string]bool, len(failed))
+	for _, inst := range failed {
+		failedHostnames[inst.Hostname] = true
+	}
+	dropped := 0
+	for _, ref := range previous {
+		if _, kept := new.instanceToAsg[ref]; kept || failedHostnames[ref.Hostname] {
+			continue
+		}
+		if keptByHostname(new, ref.Hostname) {
+			continue
+		}
+		dropped++
+	}
+	return dropped
+}
+
+// keptByHostname matches refs whose ProviderID changed form (e.g. a placeholder that gained its API location).
+func keptByHostname(c *instanceMaps, hostname string) bool {
+	for ref := range c.instanceToAsg {
+		if ref.Hostname == hostname {
+			return true
+		}
+	}
+	return false
+}
+
+// prunePendingCreates drops entries the API has listed or that outlived the grace period.
+// Must be called with cacheMutex held.
+func (m *autoScalingGroups) prunePendingCreates(seenHostnames map[string]bool, now time.Time) {
+	for hostname, p := range m.pendingCreates {
+		if seenHostnames[hostname] || now.Sub(p.createdAt) > pendingInstanceGracePeriod {
+			delete(m.pendingCreates, hostname)
 		}
 	}
 }
@@ -420,11 +500,20 @@ func (m *autoScalingGroups) buildASGFromSpec(spec string) (*Asg, error) {
 // Parse and register each node group spec into the ASG map.
 // Fails on first invalid spec.
 func (m *autoScalingGroups) parseASGNodeGroupSpecs(specs []string) error {
+	hostnameBaseOwner := make(map[string]string) // effective hostname base -> ASG name
 	for _, spec := range specs {
 		asg, err := m.buildASGFromSpec(spec)
 		if err != nil {
 			return err
 		}
+		if _, dup := m.registeredAsgs[asg.AsgRef]; dup {
+			return fmt.Errorf("duplicate ASG name %q in node group specs", asg.Name)
+		}
+		base := asg.hostnameBase()
+		if owner, clash := hostnameBaseOwner[base]; clash {
+			return fmt.Errorf("ASGs %q and %q both generate hostnames starting with %q; VMs could not be told apart", owner, asg.Name, base+ASG_SEPARATOR)
+		}
+		hostnameBaseOwner[base] = asg.Name
 		m.registeredAsgs[asg.AsgRef] = asg
 		m.asgNodeGroupSpecs[asg.AsgRef] = spec
 	}
@@ -466,10 +555,12 @@ func (m *autoScalingGroups) updateCacheWithInstances(asg *Asg, results []instanc
 	m.cacheMutex.Lock()
 	defer m.cacheMutex.Unlock()
 
+	now := time.Now()
 	for _, r := range results {
 		m.instanceToAsg[r.ref] = asg
 		m.asgToInstances[asg.AsgRef] = append(m.asgToInstances[asg.AsgRef], r.ref)
 		m.instanceIDs[r.ref] = r.id
+		m.pendingCreates[r.ref.Hostname] = pendingInstance{ref: r.ref, asgRef: asg.AsgRef, id: r.id, createdAt: now}
 	}
 }
 
@@ -481,10 +572,14 @@ func (m *autoScalingGroups) scaleUpAsg(asg *Asg, delta int) error {
 
 	ctx := context.Background()
 
+	// scaleMutex is held across API calls; each call is bounded by apiCallTimeout.
 	asg.scaleMutex.Lock()
 	defer asg.scaleMutex.Unlock()
 
-	klog.Infof("Scale-up ASG %s by %d (curSize=%d, max=%d)", asg.Name, delta, asg.curSize, asg.maxSize)
+	m.cacheMutex.RLock()
+	curSize := asg.curSize
+	m.cacheMutex.RUnlock()
+	klog.Infof("Scale-up ASG %s by %d (curSize=%d, max=%d)", asg.Name, delta, curSize, asg.maxSize)
 
 	// Implement backoff after terminal failures (NoCapacity, Error, etc).
 	if err := m.checkFailureBackoff(asg); err != nil {
@@ -503,18 +598,18 @@ func (m *autoScalingGroups) scaleUpAsg(asg *Asg, delta int) error {
 		}
 	}()
 
+	nodeConfig, err := m.getNodeConfigForAsg(asg)
+	if err != nil {
+		return fmt.Errorf("get node config failed: %w", err)
+	}
+
 	// Find an eligible location for this ASG instance type (provider affinity)
-	location, err := m.dcService.GetInstanceAvailabilityLocation(ctx, asg.instanceType, asg.AvailabilityLocations)
+	location, err := m.dcService.GetInstanceAvailabilityLocation(ctx, asg.instanceType, nodeConfig.IsSpot, asg.AvailabilityLocations)
 	if err != nil {
 		return fmt.Errorf("availability check failed: %w", err)
 	}
 	if location == "" {
 		return fmt.Errorf("instance type %s not available", asg.instanceType)
-	}
-
-	nodeConfig, err := m.getNodeConfigForAsg(asg)
-	if err != nil {
-		return fmt.Errorf("get node config failed: %w", err)
 	}
 
 	rollbackNeeded = false // partial success from here is tolerated
@@ -610,27 +705,28 @@ func (m *autoScalingGroups) getNodeConfigForAsg(asg *Asg) (*nodeConfig, error) {
 // Actually issues the API call to provision an instance for the ASG at location.
 // Handles all env/label/script patching, cleans up script on exit.
 func (m *autoScalingGroups) createInstanceForAsg(ctx context.Context, asg *Asg, nodeConfig *nodeConfig, location string) (string, string, error) {
-	baseName := asg.hostnamePrefix
-	if baseName == "" {
-		baseName = asg.Name
+	hostname, err := m.newUniqueHostname(ctx, asg, location)
+	if err != nil {
+		return "", "", err
 	}
 
-	hostname := strings.ReplaceAll(
-		fmt.Sprintf("%s%s%s-%08x", baseName, ASG_SEPARATOR, strings.ToLower(location), rand.Uint32()),
-		".", "-")
+	klog.V(4).Infof("Creating instance %s with providerID=%s", hostname, formatProviderID(location, hostname))
 
-	providerID := formatProviderID(location, hostname)
-	klog.V(4).Infof("Creating instance %s with providerID=%s", hostname, providerID)
-
-	startupScriptID, err := m.createStartupScript(ctx, asg, nodeConfig, providerID)
+	startupScriptID, err := m.createStartupScript(ctx, asg, nodeConfig)
 	if err != nil {
 		return "", hostname, fmt.Errorf("create startup script failed: %w", err)
 	}
 	if startupScriptID == "" {
 		return "", hostname, errors.New("startup script creation returned empty ID")
 	}
-	// Always safe to delete script after call returns (API copies script-on-create, so this is just housekeeping).
-	defer m.dcService.DeleteStartScript(ctx, startupScriptID)
+	// Deleted once the create call returns (API copies the script on create). The rendered script
+	// holds the join token, so a failed delete is logged at error level rather than ignored.
+	defer func() {
+		if err := m.dcService.DeleteStartScript(ctx, startupScriptID); err != nil {
+			klog.Errorf("Startup script %s for %s was not deleted and still contains the cluster join token; delete it manually: %v",
+				startupScriptID, hostname, err)
+		}
+	}()
 
 	if nodeConfig.Image == "" {
 		return "", hostname, fmt.Errorf("no image configured for instance type %s", asg.instanceType)
@@ -642,7 +738,7 @@ func (m *autoScalingGroups) createInstanceForAsg(ctx context.Context, asg *Asg, 
 		SSHKeyIDs:       nodeConfig.SSHKeyIDs,
 		StartupScriptID: &startupScriptID,
 		Hostname:        hostname,
-		Description:     asg.Name,
+		Description:     ownershipMarker(m.cfg.ClusterName, asg.Name),
 		LocationCode:    location,
 		IsSpot:          nodeConfig.IsSpot,
 		Contract:        nodeConfig.Contract,
@@ -652,11 +748,17 @@ func (m *autoScalingGroups) createInstanceForAsg(ctx context.Context, asg *Asg, 
 			Size: nodeConfig.OSVolumeSize,
 		},
 	}
+	if nodeConfig.IsSpot {
+		input.OSVolume.OnSpotDiscontinue = verda.SpotDiscontinueDeletePermanent
+	}
 
 	if len(nodeConfig.Volumes) > 0 {
 		input.Volumes = make([]verda.VolumeCreateRequest, len(nodeConfig.Volumes))
 		for i, vol := range nodeConfig.Volumes {
 			input.Volumes[i] = verda.VolumeCreateRequest{Name: vol.Name, Size: vol.Size, Type: vol.Type}
+			if nodeConfig.IsSpot {
+				input.Volumes[i].OnSpotDiscontinue = verda.SpotDiscontinueDeletePermanent
+			}
 		}
 	}
 
@@ -669,16 +771,43 @@ func (m *autoScalingGroups) createInstanceForAsg(ctx context.Context, asg *Asg, 
 	return instance.ID, hostname, nil
 }
 
-// createStartupScript decodes the cloud-config startup script, renders it with env-backed template data, and uploads to Verda.
-// providerID is unused—the caller derives hostnames/cache keys independently and CCM supplies per-node identity after join.
-func (m *autoScalingGroups) createStartupScript(ctx context.Context, asg *Asg, nodeConfig *nodeConfig, _ string) (string, error) {
+// newUniqueHostname returns {base}-vm-{location}-{random} not used by any known VM.
+func (m *autoScalingGroups) newUniqueHostname(ctx context.Context, asg *Asg, location string) (string, error) {
+	instances, err := m.dcService.ListInstancesCached(ctx)
+	if err != nil {
+		return "", fmt.Errorf("list instances for hostname uniqueness: %w", err)
+	}
+	taken := make(map[string]bool, len(instances))
+	for _, inst := range instances {
+		taken[strings.ToLower(inst.Hostname)] = true
+	}
+	m.cacheMutex.RLock()
+	for ref := range m.instanceToAsg {
+		taken[strings.ToLower(ref.Hostname)] = true
+	}
+	m.cacheMutex.RUnlock()
+
+	for range maxHostnameAttempts {
+		hostname := fmt.Sprintf("%s%s%s-%08x", asg.hostnameBase(), ASG_SEPARATOR, strings.ToLower(location), rand.Uint32())
+		if !taken[hostname] {
+			return hostname, nil
+		}
+	}
+	return "", fmt.Errorf("could not generate an unused hostname for ASG %s after %d attempts", asg.Name, maxHostnameAttempts)
+}
+
+// createStartupScript decodes the cloud-config startup script, renders it with env-backed and per-group template data, and uploads to Verda.
+func (m *autoScalingGroups) createStartupScript(ctx context.Context, asg *Asg, nodeConfig *nodeConfig) (string, error) {
 	scriptName := fmt.Sprintf("as-%s", asg.Name)
 	decodedScript, err := base64.StdEncoding.DecodeString(nodeConfig.StartupScript)
 	if err != nil {
 		return "", fmt.Errorf("failed to decode startup script: %v", err)
 	}
 
-	vars := StartupScriptTemplateData{}
+	vars := StartupScriptTemplateData{
+		NodeLabels: kubeletNodeLabelsFlag(registeredNodeLabels(asg, nodeConfig)),
+		NodeTaints: kubeletTaintsFlag(nodeConfig.Taints),
+	}
 	if m.cfg != nil {
 		vars.MasterIP = m.cfg.MasterIP
 		vars.MasterPort = m.cfg.MasterPort
@@ -709,6 +838,7 @@ func (m *autoScalingGroups) removeInstanceFromCache(hostname string, asg *Asg) {
 	}
 	delete(m.instanceToAsg, *ref)
 	delete(m.instanceIDs, *ref)
+	delete(m.pendingCreates, hostname)
 	refs := m.asgToInstances[asg.AsgRef]
 	for i, r := range refs {
 		if r.Hostname == hostname {
@@ -751,9 +881,11 @@ func (m *autoScalingGroups) InstancesForAsg(ref AsgRef) ([]verda.Instance, error
 			instances = append(instances, inst)
 		} else {
 			// Not yet visible in API (ordered state), provide placeholder for autoscaler logic.
+			// Location comes from the ref so the placeholder's providerID matches what the CCM writes.
 			instances = append(instances, verda.Instance{
 				ID:       r.ProviderID,
 				Hostname: r.Hostname,
+				Location: locationFromProviderID(r.ProviderID),
 				Status:   verda.StatusOrdered,
 			})
 		}
@@ -792,7 +924,7 @@ func (m *autoScalingGroups) DeleteAsg(ref AsgRef) error {
 		sem <- struct{}{}
 		go func(id, hostname string) {
 			defer func() { <-sem; wg.Done() }()
-			if err := m.dcService.PerformInstanceAction(ctx, id, verda.ActionDelete); err != nil {
+			if err := m.dcService.DeleteInstance(ctx, id); err != nil {
 				errsCh <- fmt.Errorf("delete %s failed: %w", hostname, err)
 			}
 		}(instanceID, insRef.Hostname)
@@ -859,7 +991,7 @@ func (m *autoScalingGroups) DeleteInstance(ref InstanceRef) error {
 	klog.V(4).Infof("DeleteInstance: deleting %s (id=%s, curSize: %d)",
 		ref.Hostname, instanceID, curSizeAtRead)
 
-	if err := m.dcService.PerformInstanceAction(ctx, instanceID, verda.ActionDelete); err != nil {
+	if err := m.dcService.DeleteInstance(ctx, instanceID); err != nil {
 		return fmt.Errorf("delete instance %s failed: %w", ref.Hostname, err)
 	}
 

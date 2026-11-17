@@ -19,13 +19,12 @@ package verdacloud
 import (
 	"context"
 	"fmt"
-	"strings"
 	"sync"
 
 	"github.com/verda-cloud/verdacloud-sdk-go/pkg/verda"
 )
 
-// instanceAction records an PerformInstanceAction call (instance ID + action name).
+// instanceAction records a DeleteInstance call (instance ID + action name).
 type instanceAction struct {
 	ID     string
 	Action string
@@ -43,11 +42,12 @@ type mockDCService struct {
 	// Callback hooks. When non-nil, these override the default behaviour.
 	createFunc func(ctx context.Context, req *verda.CreateInstanceRequest) (*verda.Instance, error)
 	actionFunc func(ctx context.Context, instanceID, action string) error
-	deleteFunc func(ctx context.Context, instanceID string) error
 
 	// Recorded calls for assertions.
 	created []verda.CreateInstanceRequest
-	actions []instanceAction
+	actions []instanceAction // DeleteInstance calls, recorded as delete actions
+
+	availIsSpot []bool // isSpot passed to each GetInstanceAvailabilityLocation call
 
 	// GetInstanceAvailabilityLocation controls.
 	availLocation    string
@@ -97,34 +97,6 @@ func (m *mockDCService) GetInstanceByHostname(ctx context.Context, hostname stri
 	return nil, fmt.Errorf("instance %s not found", hostname)
 }
 
-func (m *mockDCService) GetActiveInstancesForAsg(_ context.Context, asgName string, hostnamePrefix ...string) ([]verda.Instance, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.instancesErr != nil {
-		return nil, m.instancesErr
-	}
-
-	matchKey := asgName
-	if len(hostnamePrefix) > 0 && hostnamePrefix[0] != "" {
-		matchKey = hostnamePrefix[0]
-	}
-
-	var filtered []verda.Instance
-	for _, inst := range m.instances {
-		if !isActiveStatus(inst.Status) {
-			continue
-		}
-		extractedPrefix, err := extractAsgNameFromHostname(inst.Hostname)
-		if err != nil {
-			continue
-		}
-		if strings.EqualFold(extractedPrefix, matchKey) {
-			filtered = append(filtered, inst)
-		}
-	}
-	return filtered, nil
-}
-
 func (m *mockDCService) CreateInstance(ctx context.Context, req *verda.CreateInstanceRequest) (*verda.Instance, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -146,27 +118,19 @@ func (m *mockDCService) CreateInstance(ctx context.Context, req *verda.CreateIns
 func (m *mockDCService) DeleteInstance(ctx context.Context, instanceID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.deleteFunc != nil {
-		return m.deleteFunc(ctx, instanceID)
-	}
-	return nil
-}
 
-func (m *mockDCService) PerformInstanceAction(ctx context.Context, instanceID, action string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	m.actions = append(m.actions, instanceAction{ID: instanceID, Action: action})
+	m.actions = append(m.actions, instanceAction{ID: instanceID, Action: verda.ActionDelete})
 
 	if m.actionFunc != nil {
-		return m.actionFunc(ctx, instanceID, action)
+		return m.actionFunc(ctx, instanceID, verda.ActionDelete)
 	}
 	return nil
 }
 
-func (m *mockDCService) GetInstanceAvailabilityLocation(_ context.Context, _ string, _ []string) (string, error) {
+func (m *mockDCService) GetInstanceAvailabilityLocation(_ context.Context, _ string, isSpot bool, _ []string) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.availIsSpot = append(m.availIsSpot, isSpot)
 	return m.availLocation, m.availLocationErr
 }
 

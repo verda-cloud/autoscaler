@@ -49,6 +49,14 @@ type Asg struct {
 	targetSizeMutex sync.Mutex
 }
 
+// hostnameBase is the part of generated hostnames before ASG_SEPARATOR.
+func (asg *Asg) hostnameBase() string {
+	if asg.hostnamePrefix != "" {
+		return asg.hostnamePrefix
+	}
+	return asg.Name
+}
+
 // AsgRef is a reference to an Auto Scaling Group by name.
 type AsgRef struct {
 	Name string
