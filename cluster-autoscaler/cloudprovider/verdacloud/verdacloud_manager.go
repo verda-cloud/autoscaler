@@ -30,11 +30,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/verda-cloud/verdacloud-sdk-go/pkg/verda"
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
+	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/verdacloud/verda-go"
 	klog "k8s.io/klog/v2"
 )
 
@@ -100,7 +100,7 @@ func createVerdacloudManager(cloudReader io.Reader, discoveryOpts cloudprovider.
 		return nil, err
 	}
 
-	sdkProvider, err := createVerdacloudSDKProvider(cfg)
+	sdkProvider, err := createVerdacloudSDKProvider()
 	if err != nil {
 		return nil, err
 	}

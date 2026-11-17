@@ -21,7 +21,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/verda-cloud/verdacloud-sdk-go/pkg/verda"
+	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/verdacloud/verda-go"
 )
 
 // instanceAction records a DeleteInstance call (instance ID + action name).

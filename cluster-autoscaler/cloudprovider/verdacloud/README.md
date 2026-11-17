@@ -26,7 +26,6 @@ The cluster autoscaler for VerdaCloud (formerly DataCrunch.io) scales worker nod
     "price": "FIXED_PRICE",
     "contract": "PAY_AS_YOU_GO"
   },
-  "debug": false,
   "availableLocations": ["FIN-02", "FIN-03"],
   "osVolumeSize": 50,
   "labels": ["env=production"],

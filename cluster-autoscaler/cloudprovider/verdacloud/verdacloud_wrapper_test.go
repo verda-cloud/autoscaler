@@ -25,7 +25,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/verda-cloud/verdacloud-sdk-go/pkg/verda"
+	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/verdacloud/verda-go"
 )
 
 // TestTypeCacheRoundtrip verifies a value cached via cacheType is returned
