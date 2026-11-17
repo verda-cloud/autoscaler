@@ -2515,38 +2515,38 @@ func providerIDFor(hostname string) string {
 	return fmt.Sprintf("%s%s/%s", testProviderPrefix, testLocation, hostname)
 }
 
-func TestCategorizeInstancesForAsg_Ownership(t *testing.T) {
+func TestCategorizeInstancesForAsg_MembershipIsHostnamePrefixOnly(t *testing.T) {
 	_, asg, asgs := newTestEnv(t)
-	hostname := fmt.Sprintf("%s-vm-fin-01-0000000a", testHostnamePrefix)
 
 	cases := []struct {
 		name        string
+		hostname    string
 		description string
 		wantAdopted bool
 	}{
-		{"marker naming this cluster", ownershipMarker(testClusterName, asg.Name), true},
-		{"marker naming another cluster", ownershipMarker("other-cluster", asg.Name), false},
-		{"legacy: empty description", "", true},
-		{"legacy: description is the group name", asg.Name, true},
-		{"unrelated description", "hand-made VM", false},
-		{"marker without cluster field", ownershipMarkerPrefix + " group=" + asg.Name, false},
+		{"matching prefix, empty description", testHostnamePrefix + "-vm-fin-01-0000000a", "", true},
+		{"matching prefix, group name description", testHostnamePrefix + "-vm-fin-01-0000000b", asg.Name, true},
+		{"matching prefix, edited description", testHostnamePrefix + "-vm-fin-01-0000000c", "verda-ca cluster=other-cluster group=x", true},
+		{"other group prefix", "other-pool-vm-fin-01-0000000d", asg.Name, false},
+		{"prefix only as substring", testHostnamePrefix + "x-vm-fin-01-0000000e", "", false},
+		{"no -vm- separator", testHostnamePrefix + "-fin-01-0000000f", "", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			inst := verda.Instance{ID: "i-1", Hostname: hostname, Description: tc.description, Status: verda.StatusRunning, Location: testLocation}
+			inst := verda.Instance{ID: "i-1", Hostname: tc.hostname, Description: tc.description, Status: verda.StatusRunning, Location: testLocation}
 			active, _, seen := asgs.categorizeInstancesForAsg([]verda.Instance{inst}, asg)
-			if got := len(active) == 1 && seen[hostname]; got != tc.wantAdopted {
+			if got := len(active) == 1 && seen[tc.hostname]; got != tc.wantAdopted {
 				t.Errorf("adopted=%v, want %v", got, tc.wantAdopted)
 			}
 		})
 	}
 }
 
-func TestRegenerate_NeverAdoptsOrCleansUpOtherClusterVMs(t *testing.T) {
+func TestRegenerate_NeverTouchesVMsWithAnotherHostnamePrefix(t *testing.T) {
 	mock, asg, asgs := newTestEnvWithMock(t)
 	foreign := []verda.Instance{
-		{ID: "f-1", Hostname: testHostnamePrefix + "-vm-fin-01-00000001", Description: ownershipMarker("other-cluster", asg.Name), Status: verda.StatusRunning, Location: testLocation},
-		{ID: "f-2", Hostname: testHostnamePrefix + "-vm-fin-01-00000002", Description: ownershipMarker("other-cluster", asg.Name), Status: verda.StatusError, Location: testLocation},
+		{ID: "f-1", Hostname: "other-pool-vm-fin-01-00000001", Description: asg.Name, Status: verda.StatusRunning, Location: testLocation},
+		{ID: "f-2", Hostname: "other-pool-vm-fin-01-00000002", Description: asg.Name, Status: verda.StatusError, Location: testLocation},
 	}
 	mock.setInstances(foreign)
 
@@ -2558,7 +2558,6 @@ func TestRegenerate_NeverAdoptsOrCleansUpOtherClusterVMs(t *testing.T) {
 	if len(asgs.failedInstances) != 0 {
 		t.Errorf("foreign failed VMs must not be tracked for cleanup: %v", asgs.failedInstances)
 	}
-
 	refs, _ := asgs.InstanceRefsForAsg(asg.AsgRef)
 	if len(refs) != 0 || asg.curSize != 0 {
 		t.Errorf("foreign VMs adopted: refs=%v curSize=%d", refs, asg.curSize)
@@ -2647,7 +2646,7 @@ func TestScaleUp_CreateRequestOwnershipAndSpotVolumes(t *testing.T) {
 			}
 
 			req := mock.created[0]
-			if want := ownershipMarker(testClusterName, testAsgName); req.Description != want {
+			if want := testAsgName; req.Description != want {
 				t.Errorf("Description = %q, want %q", req.Description, want)
 			}
 			wantPolicy := ""
@@ -2678,7 +2677,7 @@ func TestScaleUp_StartupScriptGetsKubeletLabelsAndTaints(t *testing.T) {
 		t.Fatalf("scale-up: %v", err)
 	}
 
-	want := "labels=team=ml,verda.com/accelerator=" + testInstanceType + ",verda.com/node-group=" + testAsgName +
+	want := "labels=team=ml,verda.com/accelerator=" + testInstanceType + ",verda.com/cluster=" + testClusterName + ",verda.com/node-group=" + testAsgName +
 		" taints=dedicated=gpu:NoSchedule,nvidia.com/gpu:NoExecute"
 	if got := mock.createdScripts[0].Script; got != want {
 		t.Errorf("rendered script:\n got %q\nwant %q", got, want)
