@@ -20,14 +20,29 @@ import (
 	"bytes"
 	"fmt"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"text/template"
 	"text/template/parse"
+
+	apiv1 "k8s.io/api/core/v1"
 )
 
-// asgSpecNameRe enforces a DNS-label-ish format for ASG names and hostname prefixes.
-var asgSpecNameRe = regexp.MustCompile(`^[a-z0-9A-Z]+[a-z0-9A-Z\-\.\_]*[a-z0-9A-Z]+$|^[a-z0-9A-Z]{1}$`)
+// asgSpecNameRe: lowercase DNS label, so generated hostnames are stored and matched verbatim.
+var asgSpecNameRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
+
+// validateHostnameBase rejects names whose generated hostname would not parse back to the same group.
+func validateHostnameBase(kind, name string) error {
+	if !asgSpecNameRe.MatchString(name) {
+		return fmt.Errorf("invalid %s %q: must be lowercase letters, digits and '-', starting and ending with a letter or digit", kind, name)
+	}
+	if strings.Contains(name, ASG_SEPARATOR) || strings.HasSuffix(name, "-"+ASG_SEPARATOR_MAGIC_NUMBER) {
+		return fmt.Errorf("invalid %s %q: must not contain %q or end with %q (reserved hostname separator)",
+			kind, name, ASG_SEPARATOR, "-"+ASG_SEPARATOR_MAGIC_NUMBER)
+	}
+	return nil
+}
 
 func parseAsgSpec(spec string) (*VerdacloudAsgSpec, error) {
 	parts := strings.Split(spec, ":")
@@ -45,15 +60,15 @@ func parseAsgSpec(spec string) (*VerdacloudAsgSpec, error) {
 	}
 
 	asgName := parts[3]
-	if !asgSpecNameRe.MatchString(asgName) {
-		return nil, fmt.Errorf("invalid ASG name: %s", asgName)
+	if err := validateHostnameBase("ASG name", asgName); err != nil {
+		return nil, err
 	}
 
 	hostnamePrefix := ""
 	if len(parts) == 5 && parts[4] != "" {
 		hostnamePrefix = parts[4]
-		if !asgSpecNameRe.MatchString(hostnamePrefix) {
-			return nil, fmt.Errorf("invalid hostname prefix: %s", hostnamePrefix)
+		if err := validateHostnameBase("hostname prefix", hostnamePrefix); err != nil {
+			return nil, err
 		}
 	}
 
@@ -96,6 +111,43 @@ func instanceRefFromProviderId(providerId string) (*InstanceRef, error) {
 	return &InstanceRef{Hostname: parts[len(parts)-1], ProviderID: providerId}, nil
 }
 
+// locationFromProviderID returns <location> from "verdacloud://<location>/<hostname>", or "" if absent.
+func locationFromProviderID(providerID string) string {
+	rest, ok := strings.CutPrefix(providerID, verdacloudProviderIDPrefix)
+	if !ok {
+		return ""
+	}
+	location, _, found := strings.Cut(rest, "/")
+	if !found {
+		return ""
+	}
+	return location
+}
+
+// kubeletNodeLabelsFlag renders labels in kubelet --node-labels format, sorted for stable output.
+func kubeletNodeLabelsFlag(labels map[string]string) string {
+	pairs := make([]string, 0, len(labels))
+	for k, v := range labels {
+		pairs = append(pairs, k+"="+v)
+	}
+	slices.Sort(pairs)
+	return strings.Join(pairs, ",")
+}
+
+// kubeletTaintsFlag renders taints in kubelet --register-with-taints format, sorted for stable output.
+func kubeletTaintsFlag(taints []apiv1.Taint) string {
+	specs := make([]string, 0, len(taints))
+	for _, t := range taints {
+		spec := t.Key
+		if t.Value != "" {
+			spec += "=" + t.Value
+		}
+		specs = append(specs, spec+":"+string(t.Effect))
+	}
+	slices.Sort(specs)
+	return strings.Join(specs, ",")
+}
+
 func extractAsgNameFromHostname(hostname string) (string, error) {
 	separator := fmt.Sprintf("-%s-", ASG_SEPARATOR_MAGIC_NUMBER)
 
@@ -112,13 +164,18 @@ func extractAsgNameFromHostname(hostname string) (string, error) {
 }
 
 // StartupScriptTemplateData is the only text/template root for startupScript; extending it is a code change, not operator config.
-// Per-node identity arrives from CCM after join; unknown template keys fail scale-up via missingkey=error.
+// ProviderID and location labels arrive from CCM after join; unknown template keys fail scale-up via missingkey=error.
 type StartupScriptTemplateData struct {
 	// Filled from process env on the autoscaler Pod (typically envFrom Secret), not cloud-config.
 	MasterIP     string
 	MasterPort   string
 	JoinToken    string
 	JoinHashFull string
+
+	// Per-group kubelet flag values (--node-labels / --register-with-taints); must reach kubelet
+	// so real nodes match the template node the autoscaler simulated.
+	NodeLabels string
+	NodeTaints string
 }
 
 // renderStartupScript expands operator startupScript templates into bytes for Verda startup-script creation.

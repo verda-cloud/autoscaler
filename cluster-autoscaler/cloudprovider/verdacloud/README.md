@@ -16,6 +16,7 @@ The cluster autoscaler for VerdaCloud (formerly DataCrunch.io) scales worker nod
 
 ```json
 {
+  "clusterName": "prod-eu",
   "image": {
     "gpu": "24.04.kubernetes1.31.1.cuda12.9.qcow2",
     "cpu": "24.04.kubernetes1.31.1.cuda12.9.qcow2"
@@ -54,6 +55,7 @@ The JSON above is the authoritative format. This table summarizes top‑level ke
 
 | Key | Type | Required | Default | Notes |
 |-----|------|----------|---------|-------|
+| clusterName | string | required | — | Identifies this cluster's VMs. Written into each created VM's description as `verda-ca cluster=<clusterName> group=<asg-name>`; the autoscaler never adopts or deletes VMs marked for another cluster. 1–63 characters: letters, digits, `.`, `_`, `-`. |
 | image.gpu | string | required | — | Image for GPU nodes provided by VerdaCloud (current: k8s 1.31.1, cuda 12.9). Contact us for other versions. |
 | image.cpu | string | required | — | Image for CPU nodes provided by VerdaCloud (current: k8s 1.31.1, cuda 12.9). Contact us for other versions. |
 | sshKeyIDs | array<string> | required | — | SSH key IDs to inject. See [Fetching SSH Keys](#fetching-ssh-keys) for details. |
@@ -62,9 +64,9 @@ The JSON above is the authoritative format. This table summarizes top‑level ke
 | debug | bool | optional | false | Enables verbose logging from the verdacloud SDK (request/response traces). Equivalent to setting `VERDA_DEBUG=true` as an environment variable. |
 | availableLocations | array<string> | required | — | Location codes eligible for provisioning. Group config overwrites global. |
 | osVolumeSize | int | optional | 50 | Size of the OS volume in GB. Group config overwrites global. |
-| labels | array<string> | optional | — | Labels to apply to all nodes. Group config merges with global. |
-| startupScript | string (base64) | required | — | Base64‑encoded Go text/template. The autoscaler renders it per scale-up, substituting `{{.MasterIP}}`, `{{.MasterPort}}`, `{{.JoinToken}}`, `{{.JoinHashFull}}` from the `cluster-autoscaler-startup-env` Secret. Per-VM identity (provider-id, labels) is set post-join by verdacloud-cloud-controller-manager — not exposed as template variables. See [Startup script template](#startup-script-template) and [`examples/config.json`](examples/config.json). |
-| taints | array<object> | optional | — | Standard k8s taint objects applied to nodes |
+| labels | array<string> | optional | — | Labels to apply to all nodes, passed to kubelet via `{{.NodeLabels}}`. Group config merges with global. Labels in the `kubernetes.io`/`k8s.io` namespaces that kubelet may not self-assign (e.g. `node-role.kubernetes.io/*`, `node-restriction.kubernetes.io/*`) are rejected at startup. |
+| startupScript | string (base64) | required | — | Base64‑encoded Go text/template. The autoscaler renders it per scale-up, substituting `{{.MasterIP}}`, `{{.MasterPort}}`, `{{.JoinToken}}`, `{{.JoinHashFull}}` from the `cluster-autoscaler-startup-env` Secret and the per-group `{{.NodeLabels}}` / `{{.NodeTaints}}`, which the script must pass to kubelet. See [Startup script template](#startup-script-template) and [`examples/config.json`](examples/config.json). |
+| taints | array<object> | optional | — | Standard k8s taint objects applied to nodes, passed to kubelet via `{{.NodeTaints}}` |
 | groups | map<string,object> | optional | — | Node group definitions overriding defaults. See below for supported keys. |
 
 ### Group Configuration Overrides
@@ -119,6 +121,8 @@ Node groups must be defined with the `--nodes=<min-servers>:<max-servers>:<insta
 
 The `hostname-prefix` parameter is optional. If provided, it will be used as the base name for generated hostnames instead of the ASG name.
 
+`asg-name` and `hostname-prefix` must be lowercase letters, digits and `-`, start and end with a letter or digit, and must not contain `-vm-` or end with `-vm` (the hostname separator). Two groups may not share a name or an effective hostname base (prefix if set, otherwise name). Invalid specs fail at startup.
+
 Multiple flags will create multiple node pools. For example:
 ```
 --nodes=1:5:1A6000.10V:as-test-a6000
@@ -133,15 +137,16 @@ You can find a complete deployment sample under [examples/cluster-autoscaler-dep
 
 - Replace `your-client-id` and `your-client-secret` in the `verdacloud-credentials` Secret
 - Set `MASTER_IP`, `MASTER_PORT`, `JOIN_TOKEN`, `JOIN_HASH_FULL` in the `cluster-autoscaler-startup-env` Secret (see [Startup script template](#startup-script-template) below)
-- Update `your-ssh-key-id` in the ConfigMap
+- Set `clusterName` and update `your-ssh-key-id` in the ConfigMap
 - Modify the `--nodes` flags to match your desired instance types and scaling limits
-- Update the `startupScript` with your actual base64-encoded cluster join template
+- Update the `startupScript` with your actual base64-encoded cluster join template; it must pass `{{.NodeLabels}}` and `{{.NodeTaints}}` to kubelet
 
 ### Startup script template
 
 The `startupScript` field in `cluster-config.json` is a **Go text/template**.
 The autoscaler renders it per scale-up by substituting four cluster-wide
-variables sourced from the `cluster-autoscaler-startup-env` Secret:
+variables sourced from the `cluster-autoscaler-startup-env` Secret, plus two
+per-group values derived from the config:
 
 | Template variable | Source |
 |---|---|
@@ -149,6 +154,23 @@ variables sourced from the `cluster-autoscaler-startup-env` Secret:
 | `{{.MasterPort}}` | `MASTER_PORT` key |
 | `{{.JoinToken}}` | `JOIN_TOKEN` key |
 | `{{.JoinHashFull}}` | `JOIN_HASH_FULL` key |
+| `{{.NodeLabels}}` | `verda.com/node-group=<asg-name>`, `verda.com/accelerator=<instance-type>` (GPU types), and the merged `labels`, in kubelet `--node-labels` format |
+| `{{.NodeTaints}}` | The merged `taints` in kubelet `--register-with-taints` format; empty when the group has none |
+
+The script must pass these to kubelet (see [`examples/config.json`](examples/config.json)):
+
+```bash
+KUBELET_ARGS="--cloud-provider=external --node-labels={{.NodeLabels}}"
+{{- if .NodeTaints}}
+KUBELET_ARGS="$KUBELET_ARGS --register-with-taints={{.NodeTaints}}"
+{{- end}}
+echo "KUBELET_EXTRA_ARGS=\"$KUBELET_ARGS\"" > /etc/default/kubelet
+```
+
+The autoscaler simulates scale-ups with a template node that carries exactly
+these labels and taints. If the script drops them, pods that select a node
+group fit the template but never the real node, and every scale-up adds a VM
+nothing can use.
 
 The Secret keys are exposed as env vars on the autoscaler container via
 `envFrom: secretRef: cluster-autoscaler-startup-env` on the Deployment;
@@ -207,15 +229,22 @@ In production, source the four values from a secret manager (sealed-secrets,
 External Secrets Operator, Vault, etc.). `envFrom: secretRef:` consumes any
 Secret resource regardless of how it's populated.
 
-### Per-VM identity (provider-id and labels)
+### Per-VM identity (provider-id and location labels)
 
-Per-VM identity (`spec.providerID`, cloud labels) is set **after** the
-node joins the cluster, by `verdacloud-cloud-controller-manager`. The
-rendered startup script sets `--cloud-provider=external` on kubelet and
-does NOT need to know its providerID in advance.
+`spec.providerID`, `node.kubernetes.io/instance-type` and the location labels
+(`topology.kubernetes.io/region`, `topology.kubernetes.io/zone`,
+`verda.com/location`, all the lowercase location) are set **after** the node
+joins the cluster, by `verdacloud-cloud-controller-manager`. The rendered
+startup script sets `--cloud-provider=external` on kubelet and does NOT need
+to know its providerID in advance. Group labels and taints are not the CCM's
+job: kubelet sets them from `{{.NodeLabels}}` / `{{.NodeTaints}}`.
+
+The template node advertises the location labels only for groups with a
+single `availableLocations` entry; a multi-location group cannot know where
+its next VM lands, so location-pinned pods do not trigger its scale-up.
 
 This is a hard requirement: the autoscaler does not inject `PROVIDER_ID`
-or `LABELS` into the script. Without the CCM, new nodes will register
+into the script. Without the CCM, new nodes will register
 with the standard `node.cloudprovider.kubernetes.io/uninitialized:NoSchedule`
 taint and nothing will remove it. Deploy verdacloud-CCM before deploying
 the autoscaler — see the `verdacloud-cloud-controller-manager` repo for
@@ -243,7 +272,12 @@ make push-image BUILD_TAGS=verdacloud TAG='dev' REGISTRY='verdacloud'
 
 - Hostname format: Instances created by this provider include an internal magic separator (`-vm-`) in their hostname that encodes the ASG name or custom hostname prefix (format: `{hostname-prefix|asg-name}-vm-{location-lowercase}-{8-char-hex}`). The 8-character hex suffix is `fmt.Sprintf("%08x", rand.Uint32())`. The autoscaler relies on this magic separator to identify group membership. Examples: `custom-node-vm-fin-03-1a2b3c4d` or `as-test-1a100-vm-fin-03-deadbeef`.
 - No legacy fallback: If instances are created outside this provider with different hostname conventions, they may not be associated with the expected ASG by the autoscaler.
-- ProviderID format: `verdacloud://<location>/<hostname>`.
+- Cluster ownership: a VM joins a group only if its hostname matches the group and its description is `verda-ca cluster=<this clusterName> ...`. VMs with an empty description, or with the bare group name (what earlier versions wrote), are adopted as legacy. Any other description, including a marker naming another cluster, is ignored and never deleted.
+- Offline VMs stay members of their group, so scale-down can remove them; the CCM keeps their Node with a shutdown taint.
+- A VM missing from the instance list is dropped from its group, except VMs this process created in the last 5 minutes (create→list lag).
+- Scale-down deletes the VM together with its OS volume and every additional volume, permanently (`delete_permanently`). Spot VMs are created with `on_spot_discontinue: delete_permanently` on their volumes. Do not store data you need on node volumes.
+- Every Verda API call is bounded by a 60s timeout. Failed calls are not retried inside the provider; the autoscaler loop retries on its next pass.
+- ProviderID format: `verdacloud://<lowercase-location>/<hostname>`.
 
 ## Debugging
 
