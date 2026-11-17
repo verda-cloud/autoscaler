@@ -21,6 +21,7 @@ set -o pipefail
 echo "verify-kubelint"
 
 echo "installing dependencies"
+# Keep the bootstrap linter compatible with this branch's Go 1.25 toolchain.
 go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
 
 cd $(dirname "${BASH_SOURCE}")/..
