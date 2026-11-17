@@ -63,7 +63,7 @@ var ASG_SEPARATOR = fmt.Sprintf("-%s-", ASG_SEPARATOR_MAGIC_NUMBER)
 // delete the Node. The autoscaler does not list or delete K8s Nodes itself.
 type autoScalingGroups struct {
 	registeredAsgs    map[AsgRef]*Asg          // All known/managed ASGs (by ref)
-	asgToInstances   map[AsgRef][]InstanceRef // ASG to VM refs
+	asgToInstances    map[AsgRef][]InstanceRef // ASG to VM refs
 	instanceToAsg     map[InstanceRef]*Asg     // VM ref to ASG pointer
 	instanceIDs       map[InstanceRef]string   // Ref to API instance ID
 	asgNodeGroupSpecs map[AsgRef]string        // ASG to original spec string
@@ -244,7 +244,7 @@ func (m *autoScalingGroups) regenerate() error {
 	return nil
 }
 
-// Reconcilation routine: Bumps curSize within each ASG.
+// Reconciliation routine: Bumps curSize within each ASG.
 // Rule: If more active seen than curSize, adopt them as real (manual creation).
 //
 //	Members that vanished or reached a non-member status shrink curSize (never below active).

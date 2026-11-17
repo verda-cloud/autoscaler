@@ -28,7 +28,8 @@ import (
 )
 
 const (
-	minOSVolumeSizeGB   = 50
+	minOSVolumeSizeGB = 50
+	// BillingContractSpot is the billing contract value selecting spot instances.
 	BillingContractSpot = "SPOT"
 )
 
