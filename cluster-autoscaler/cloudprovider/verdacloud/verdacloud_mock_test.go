@@ -54,10 +54,10 @@ type mockDCService struct {
 	availLocationErr error
 
 	// CreateStartScript controls.
-	startScriptID     string
-	startScriptErr    error
-	createdScripts    []verda.CreateStartupScriptRequest // recorded uploads
-	deletedScriptIDs  []string                           // recorded deletions
+	startScriptID    string
+	startScriptErr   error
+	createdScripts   []verda.CreateStartupScriptRequest // recorded uploads
+	deletedScriptIDs []string                           // recorded deletions
 
 	// ListInstanceTypes / GetInstanceTypeDetails controls.
 	instanceTypes       []string
