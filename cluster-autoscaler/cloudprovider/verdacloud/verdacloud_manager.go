@@ -72,13 +72,18 @@ type InstanceResource struct {
 	GPU          int64
 }
 
-func createVerdacloudManager(cloudReader io.Reader, discoveryOpts cloudprovider.NodeGroupDiscoveryOptions) (*VerdacloudManager, error) {
+// defaultClusterName (the autoscaler's --cluster-name) is used when the cloud config sets no clusterName.
+func createVerdacloudManager(cloudReader io.Reader, discoveryOpts cloudprovider.NodeGroupDiscoveryOptions, defaultClusterName string) (*VerdacloudManager, error) {
 	cfg := &cloudConfig{}
 	if cloudReader != nil {
 		decoder := json.NewDecoder(cloudReader)
 		if err := decoder.Decode(cfg); err != nil {
 			return nil, err
 		}
+	}
+
+	if cfg.ClusterName == "" {
+		cfg.ClusterName = defaultClusterName
 	}
 
 	if err := cfg.validate(); err != nil {
@@ -382,6 +387,9 @@ func registeredNodeLabels(asg *Asg, nodeCfg *nodeConfig) map[string]string {
 		}
 	}
 	labels[NodeGroupLabelKey] = asg.Name
+	if nodeCfg.ClusterName != "" {
+		labels[ClusterLabelKey] = nodeCfg.ClusterName
+	}
 	if isGPUInstanceType(asg.instanceType) {
 		labels[AcceleratorLabel] = asg.instanceType
 	}

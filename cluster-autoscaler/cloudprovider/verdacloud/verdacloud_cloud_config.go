@@ -33,12 +33,12 @@ const (
 	BillingContractSpot = "SPOT"
 )
 
-// clusterNameRe keeps clusterName free of spaces and '=' so the ownership marker parses unambiguously.
+// clusterNameRe keeps clusterName a valid Kubernetes label value (it is published as ClusterLabelKey).
 var clusterNameRe = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9._-]{0,61}[A-Za-z0-9])?$`)
 
 type cloudConfig struct {
-	// ClusterName is embedded in the Description of every VM this autoscaler creates
-	// (see ownershipMarker); VMs marked for a different cluster are never adopted or deleted.
+	// ClusterName is optional and only labels nodes (ClusterLabelKey). Group membership comes from the
+	// hostname prefix alone, which Verda does not allow to change after deployment.
 	ClusterName        string                 `json:"clusterName"`
 	Image              imageConfig            `json:"image"`
 	SSHKeyIDs          []string               `json:"sshKeyIDs"`
@@ -95,6 +95,7 @@ type nodeConfig struct {
 	Contract           string
 	Price              string
 	AvailableLocations []string
+	ClusterName        string
 }
 
 type additionalVolume struct {
@@ -106,9 +107,7 @@ type additionalVolume struct {
 func (cfg *cloudConfig) validate() error {
 	var errs []error
 
-	if cfg.ClusterName == "" {
-		errs = append(errs, fmt.Errorf("clusterName is required (identifies VMs owned by this cluster)"))
-	} else if !clusterNameRe.MatchString(cfg.ClusterName) {
+	if cfg.ClusterName != "" && !clusterNameRe.MatchString(cfg.ClusterName) {
 		errs = append(errs, fmt.Errorf("clusterName %q must be 1-63 characters of letters, digits, '.', '_' or '-', starting and ending with a letter or digit", cfg.ClusterName))
 	}
 
@@ -196,6 +195,7 @@ func (cfg *cloudConfig) GetNodeConfig(asgName string) *nodeConfig {
 	}
 
 	nc := &nodeConfig{
+		ClusterName:        cfg.ClusterName,
 		IsSpot:             billingCfg.Contract == BillingContractSpot,
 		Image:              "", // set by caller based on GPU/CPU
 		StartupScript:      cfg.StartupScript,

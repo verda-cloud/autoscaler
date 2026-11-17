@@ -54,7 +54,7 @@ The JSON above is the authoritative format. This table summarizes top‑level ke
 
 | Key | Type | Required | Default | Notes |
 |-----|------|----------|---------|-------|
-| clusterName | string | required | — | Identifies this cluster's VMs. Written into each created VM's description as `verda-ca cluster=<clusterName> group=<asg-name>`; the autoscaler never adopts or deletes VMs marked for another cluster. 1–63 characters: letters, digits, `.`, `_`, `-`. |
+| clusterName | string | optional | autoscaler `--cluster-name` | Labels every node with `verda.com/cluster=<clusterName>`. Informational only: it does not decide which VMs belong to a node group. Must be a valid Kubernetes label value (1–63 characters: letters, digits, `.`, `_`, `-`). |
 | image.gpu | string | required | — | Image for GPU nodes provided by VerdaCloud (current: k8s 1.31.1, cuda 12.9). Contact us for other versions. |
 | image.cpu | string | required | — | Image for CPU nodes provided by VerdaCloud (current: k8s 1.31.1, cuda 12.9). Contact us for other versions. |
 | sshKeyIDs | array<string> | required | — | SSH key IDs to inject. See [Fetching SSH Keys](#fetching-ssh-keys) for details. |
@@ -136,7 +136,7 @@ You can find a complete deployment sample under [examples/cluster-autoscaler-dep
 
 - Replace `your-client-id` and `your-client-secret` in the `verdacloud-credentials` Secret
 - Set `MASTER_IP`, `MASTER_PORT`, `JOIN_TOKEN`, `JOIN_HASH_FULL` in the `cluster-autoscaler-startup-env` Secret (see [Startup script template](#startup-script-template) below)
-- Set `clusterName` and update `your-ssh-key-id` in the ConfigMap
+- Update `your-ssh-key-id` in the ConfigMap (and optionally `clusterName`, which only labels nodes)
 - Modify the `--nodes` flags to match your desired instance types and scaling limits
 - Update the `startupScript` with your actual base64-encoded cluster join template; it must pass `{{.NodeLabels}}` and `{{.NodeTaints}}` to kubelet
 
@@ -271,7 +271,8 @@ make push-image BUILD_TAGS=verdacloud TAG='dev' REGISTRY='verdacloud'
 
 - Hostname format: Instances created by this provider include an internal magic separator (`-vm-`) in their hostname that encodes the ASG name or custom hostname prefix (format: `{hostname-prefix|asg-name}-vm-{location-lowercase}-{8-char-hex}`). The 8-character hex suffix is `fmt.Sprintf("%08x", rand.Uint32())`. The autoscaler relies on this magic separator to identify group membership. Examples: `custom-node-vm-fin-03-1a2b3c4d` or `as-test-1a100-vm-fin-03-deadbeef`.
 - No legacy fallback: If instances are created outside this provider with different hostname conventions, they may not be associated with the expected ASG by the autoscaler.
-- Cluster ownership: a VM joins a group only if its hostname matches the group and its description is `verda-ca cluster=<this clusterName> ...`. VMs with an empty description, or with the bare group name (what earlier versions wrote), are adopted as legacy. Any other description, including a marker naming another cluster, is ignored and never deleted.
+- Group membership is decided by the hostname prefix only (`{hostname-prefix|asg-name}-vm-`). Verda hostnames are unique within a project and cannot be changed after deployment, so membership cannot be altered by editing a VM. The VM description is informational (the group name) and is never read.
+- Several clusters in one Verda project: every VM whose hostname starts with a group's prefix is treated as that group's member. Give each cluster's node groups distinct names or `hostnamePrefix` values (for example `prd-gpu-h100` and `stg-gpu-h100`); within one cluster the autoscaler already rejects colliding prefixes at startup.
 - Offline VMs stay members of their group, so scale-down can remove them; the CCM keeps their Node with a shutdown taint.
 - A VM missing from the instance list is dropped from its group, except VMs this process created in the last 5 minutes (create→list lag).
 - Scale-down deletes the VM together with its OS volume and every additional volume, permanently (`delete_permanently`). Spot VMs are created with `on_spot_discontinue: delete_permanently` on their volumes. Do not store data you need on node volumes.
