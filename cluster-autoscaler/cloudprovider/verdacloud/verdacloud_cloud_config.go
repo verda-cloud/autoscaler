@@ -19,18 +19,27 @@ package verdacloud
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 
 	apiv1 "k8s.io/api/core/v1"
 	klog "k8s.io/klog/v2"
+	kubeletapis "k8s.io/kubelet/pkg/apis"
 )
 
 const (
-	minOSVolumeSizeGB   = 50
+	minOSVolumeSizeGB = 50
+	// BillingContractSpot is the billing contract value selecting spot instances.
 	BillingContractSpot = "SPOT"
 )
 
+// clusterNameRe keeps clusterName free of spaces and '=' so the ownership marker parses unambiguously.
+var clusterNameRe = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9._-]{0,61}[A-Za-z0-9])?$`)
+
 type cloudConfig struct {
+	// ClusterName is embedded in the Description of every VM this autoscaler creates
+	// (see ownershipMarker); VMs marked for a different cluster are never adopted or deleted.
+	ClusterName        string                 `json:"clusterName"`
 	Image              imageConfig            `json:"image"`
 	SSHKeyIDs          []string               `json:"sshKeyIDs"`
 	BillingConfig      billingConfig          `json:"billingConfig"`
@@ -47,7 +56,7 @@ type cloudConfig struct {
 	// (sourced from the cluster-autoscaler-startup-env Secret via envFrom),
 	// not from cluster-config.json. `json:"-"` keeps them out of the schema.
 	//
-	// Per-VM identity (provider-id, labels) is NOT in this set — the
+	// Per-VM identity (provider-id, location labels) is NOT in this set — the
 	// verdacloud-cloud-controller-manager sets those post-join.
 	MasterIP     string `json:"-"`
 	MasterPort   string `json:"-"`
@@ -98,6 +107,17 @@ type additionalVolume struct {
 func (cfg *cloudConfig) validate() error {
 	var errs []error
 
+	if cfg.ClusterName == "" {
+		errs = append(errs, fmt.Errorf("clusterName is required (identifies VMs owned by this cluster)"))
+	} else if !clusterNameRe.MatchString(cfg.ClusterName) {
+		errs = append(errs, fmt.Errorf("clusterName %q must be 1-63 characters of letters, digits, '.', '_' or '-', starting and ending with a letter or digit", cfg.ClusterName))
+	}
+
+	errs = append(errs, validateKubeletLabels("labels", cfg.Labels)...)
+	for name, group := range cfg.Groups {
+		errs = append(errs, validateKubeletLabels(fmt.Sprintf("groups.%s.labels", name), group.Labels)...)
+	}
+
 	if cfg.Image.GPU == "" && cfg.Image.CPU == "" {
 		errs = append(errs, fmt.Errorf("at least one image (GPU or CPU) must be specified"))
 	}
@@ -121,13 +141,25 @@ func (cfg *cloudConfig) validate() error {
 	return nil
 }
 
-func (cfg *cloudConfig) isValid() bool {
-	err := cfg.validate()
-	if err != nil {
-		klog.Error(err)
-		return false
+// validateKubeletLabels rejects labels kubelet refuses in --node-labels (it exits at startup, so the VM never joins).
+func validateKubeletLabels(field string, labels []string) []error {
+	var errs []error
+	for _, label := range labels {
+		key, _, ok := strings.Cut(label, "=")
+		if !ok {
+			continue // mergeLabels drops malformed entries with a warning
+		}
+		namespace, _, hasNamespace := strings.Cut(key, "/")
+		if !hasNamespace {
+			continue
+		}
+		restricted := namespace == "kubernetes.io" || strings.HasSuffix(namespace, ".kubernetes.io") ||
+			namespace == "k8s.io" || strings.HasSuffix(namespace, ".k8s.io")
+		if restricted && !kubeletapis.IsKubeletLabel(key) {
+			errs = append(errs, fmt.Errorf("%s: label %q is in a namespace kubelet may not self-assign; use a non-Kubernetes prefix such as verda.com/ or example.com/", field, key))
+		}
 	}
-	return true
+	return errs
 }
 
 // GetNodeConfig merges global + group overrides; group wins on conflict.

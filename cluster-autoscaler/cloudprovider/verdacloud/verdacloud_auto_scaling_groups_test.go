@@ -38,6 +38,7 @@ const (
 	testHostnamePrefix = "test"
 	testLocation       = "FIN-01"
 	testProviderPrefix = "verdacloud://"
+	testClusterName    = "test-cluster"
 )
 
 // newTestEnv creates a standard test environment with a VerdacloudManager and Asg.
@@ -63,6 +64,8 @@ func newTestEnv(t *testing.T) (*VerdacloudManager, *Asg, *autoScalingGroups) {
 		asgNodeGroupSpecs: make(map[AsgRef]string),
 		failedInstances:   make(map[string]time.Time),
 		lastFailureCheck:  make(map[AsgRef]time.Time),
+		pendingCreates:    make(map[string]pendingInstance),
+		cfg:               &cloudConfig{ClusterName: testClusterName},
 	}
 	asgs.registeredAsgs[asg.AsgRef] = asg
 
@@ -910,14 +913,14 @@ func TestCategorizeInstancesForAsg(t *testing.T) {
 			expectedFailed: 1,
 		},
 		{
-			name: "includes deleting/offline (not active, not failed)",
+			name: "offline counts as member; deleting/discontinued are neither active nor failed",
 			instances: []mockInstance{
 				{hostname: "test-vm-fin-01-00", status: "running"},
 				{hostname: "test-vm-fin-01-01", status: "deleting"},
 				{hostname: "test-vm-fin-01-02", status: "offline"},
 				{hostname: "test-vm-fin-01-03", status: "discontinued"},
 			},
-			expectedActive: 1,
+			expectedActive: 2,
 			expectedFailed: 0,
 		},
 		{
@@ -1310,65 +1313,26 @@ func TestGetAsgs(t *testing.T) {
 
 // --- curSize stability tests ---
 //
-// These tests simulate the regenerate() flow step by step:
-//   1. categorizeInstancesForAsg (split API instances into active/failed)
-//   2. preserveCachedInstances (keep recently-created instances not yet in API)
-//   3. reconcileCurSize (adjust curSize based on active/failed counts)
-//
-// Each test verifies curSize is correct after a specific lifecycle scenario.
+// Each test drives the real regenerate() against mocked API data and verifies
+// curSize is correct after a specific lifecycle scenario.
 
-// simulateRegenerate runs the core regenerate logic against test API data.
-// Returns the active count and failed count for the ASG.
+// simulateRegenerate runs regenerate() with apiInstances as the API's instance list.
+// Returns the active and failed counts the ASG observed.
 func simulateRegenerate(t *testing.T, asgs *autoScalingGroups, asg *Asg, apiInstances []verda.Instance) (activeCount, failedCount int) {
 	t.Helper()
 
-	// Snapshot (what regenerate does under RLock)
-	asgs.cacheMutex.RLock()
-	existingAsgToInstances := make(map[AsgRef][]InstanceRef, len(asgs.asgToInstances))
-	for ref, instances := range asgs.asgToInstances {
-		existingAsgToInstances[ref] = append([]InstanceRef(nil), instances...)
+	mock, ok := asgs.dcService.(*mockDCService)
+	if !ok {
+		mock = &mockDCService{}
+		asgs.dcService = mock
 	}
-	existingInstanceIDs := make(map[InstanceRef]string, len(asgs.instanceIDs))
-	for ref, id := range asgs.instanceIDs {
-		existingInstanceIDs[ref] = id
-	}
-	snapshotCurSize := asg.curSize
-	asgs.cacheMutex.RUnlock()
-
-	// Categorize
-	activeInstances, failedInstances, apiSeenHostnames := asgs.categorizeInstancesForAsg(apiInstances, asg)
-
-	// Build new maps
-	newCache := &instanceMaps{
-		instanceToAsg:  make(map[InstanceRef]*Asg),
-		asgToInstances: make(map[AsgRef][]InstanceRef),
-		instanceIDs:    make(map[InstanceRef]string),
-	}
-	for _, inst := range activeInstances {
-		ref := InstanceRef{
-			Hostname:   inst.Hostname,
-			ProviderID: testProviderPrefix + inst.Location + "/" + inst.Hostname,
-		}
-		newCache.addInstance(ref, asg, inst.ID)
+	mock.setInstances(apiInstances)
+	if err := asgs.regenerate(); err != nil {
+		t.Fatalf("regenerate: %v", err)
 	}
 
-	oldCache := &instanceMaps{
-		asgToInstances: existingAsgToInstances,
-		instanceIDs:    existingInstanceIDs,
-	}
-	asgs.preserveCachedInstances(asg, snapshotCurSize, apiSeenHostnames, oldCache, newCache)
-
-	// Swap + reconcile
-	allFailedInstances := map[AsgRef][]verda.Instance{asg.AsgRef: failedInstances}
-
-	asgs.cacheMutex.Lock()
-	asgs.instanceToAsg = newCache.instanceToAsg
-	asgs.asgToInstances = newCache.asgToInstances
-	asgs.instanceIDs = newCache.instanceIDs
-	asgs.reconcileCurSize(newCache.asgToInstances, allFailedInstances)
-	asgs.cacheMutex.Unlock()
-
-	return len(activeInstances), len(failedInstances)
+	active, failed, _ := asgs.categorizeInstancesForAsg(apiInstances, asg)
+	return len(active), len(failed)
 }
 
 // makeAPIInstances creates test instances with given statuses.
@@ -1515,47 +1479,58 @@ func TestCurSizeStability_DeleteThenRegenerate(t *testing.T) {
 }
 
 func TestCurSizeStability_ExternalDeletion(t *testing.T) {
-	// Scenario 6: Have 3 running; 1 is externally deleted (not by us); regenerate sees 2.
-	// Expected: curSize stays 3 (conservative, no failures detected).
-	// This is intentional: curSize only decreases when failed instances are detected.
-	// CA will notice the node is gone and call DecreaseTargetSize if needed.
+	// Scenario 6: 3 running VMs were listed; 1 is deleted outside the autoscaler; regenerate sees 2.
+	// Expected: the vanished VM is dropped (no ghost) and curSize follows.
 	_, asg, asgs := newTestEnv(t)
 
 	asg.curSize = 3
 	refs := createTestInstanceRefs(t, 3)
 	asgs.updateCacheWithInstances(asg, toCreateResults(refs))
+	simulateRegenerate(t, asgs, asg, makeAPIInstances(asg, []string{
+		verda.StatusRunning, verda.StatusRunning, verda.StatusRunning,
+	}))
 
-	// Regenerate: API shows only 2 (one vanished, no failure status)
-	apiInstances := makeAPIInstances(asg, []string{
+	simulateRegenerate(t, asgs, asg, makeAPIInstances(asg, []string{
 		verda.StatusRunning, verda.StatusRunning,
-	})
-	simulateRegenerate(t, asgs, asg, apiInstances)
+	}))
 
-	// curSize stays 3 because: active(2) < curSize(3) but failedCount=0
-	// reconcileCurSize only decreases when failures are detected
-	if asg.curSize != 3 {
-		t.Errorf("curSize should stay 3 (conservative, no failures), got %d", asg.curSize)
+	if asg.curSize != 2 {
+		t.Errorf("curSize = %d, want 2 (externally deleted VM must not be kept)", asg.curSize)
+	}
+	cached, _ := asgs.InstanceRefsForAsg(asg.AsgRef)
+	if len(cached) != 2 {
+		t.Errorf("cached refs = %d, want 2", len(cached))
+	}
+	for _, ref := range cached {
+		if ref.Hostname == refs[2].Hostname {
+			t.Errorf("ghost %s still cached after external deletion", ref.Hostname)
+		}
 	}
 }
 
 func TestCurSizeStability_InstanceGoesOffline(t *testing.T) {
 	// Scenario 7: Have 3 running; 1 goes offline; regenerate.
-	// Expected: curSize stays 3 (offline is ignored, not failed)
+	// Expected: the offline VM stays a group member (the CCM keeps its Node), so scale-down can remove it.
 	_, asg, asgs := newTestEnv(t)
 
 	asg.curSize = 3
 	refs := createTestInstanceRefs(t, 3)
 	asgs.updateCacheWithInstances(asg, toCreateResults(refs))
 
-	// API: 2 running, 1 offline. Offline is neither active nor failed.
 	apiInstances := makeAPIInstances(asg, []string{
 		verda.StatusRunning, verda.StatusRunning, verda.StatusOffline,
 	})
-	simulateRegenerate(t, asgs, asg, apiInstances)
+	active, _ := simulateRegenerate(t, asgs, asg, apiInstances)
 
-	// curSize stays 3: active(2) < curSize(3), but no failures detected
+	if active != 3 {
+		t.Errorf("offline VM should count as an active member: active=%d, want 3", active)
+	}
 	if asg.curSize != 3 {
-		t.Errorf("curSize should stay 3 (offline is ignored, not failed), got %d", asg.curSize)
+		t.Errorf("curSize = %d, want 3", asg.curSize)
+	}
+	cached, _ := asgs.InstanceRefsForAsg(asg.AsgRef)
+	if len(cached) != 3 {
+		t.Errorf("cached refs = %d, want 3 (offline VM must stay in its group)", len(cached))
 	}
 }
 
@@ -1767,6 +1742,7 @@ func newTestEnvWithMock(t *testing.T) (*mockDCService, *Asg, *autoScalingGroups)
 		startScriptID: "mock-script-id",
 	}
 	cfg := &cloudConfig{
+		ClusterName: testClusterName,
 		Groups: map[string]GroupConfig{
 			testAsgName: {AvailableLocations: []string{testLocation}},
 		},
@@ -1779,6 +1755,7 @@ func newTestEnvWithMock(t *testing.T) (*mockDCService, *Asg, *autoScalingGroups)
 		asgNodeGroupSpecs: make(map[AsgRef]string),
 		failedInstances:   make(map[string]time.Time),
 		lastFailureCheck:  make(map[AsgRef]time.Time),
+		pendingCreates:    make(map[string]pendingInstance),
 		cfg:               cfg,
 		dcService:         mock,
 	}
@@ -1807,7 +1784,7 @@ func TestCreateStartupScript_RendersAndUploads(t *testing.T) {
 	body := []byte(`kubeadm join "{{.MasterIP}}:{{.MasterPort}}" --token "{{.JoinToken}}" --discovery-token-ca-cert-hash "{{.JoinHashFull}}"`)
 	nodeCfg := &nodeConfig{StartupScript: base64.StdEncoding.EncodeToString(body)}
 
-	id, err := asgs.createStartupScript(context.Background(), asg, nodeCfg, "verdacloud://FIN-02/host-x")
+	id, err := asgs.createStartupScript(context.Background(), asg, nodeCfg)
 	if err != nil {
 		t.Fatalf("createStartupScript: %v", err)
 	}
@@ -2120,7 +2097,7 @@ func TestReconcileCurSize(t *testing.T) {
 			}
 
 			asgs.cacheMutex.Lock()
-			asgs.reconcileCurSize(asgToInstances, failedByAsg)
+			asgs.reconcileCurSize(asgToInstances, failedByAsg, nil)
 			asgs.cacheMutex.Unlock()
 
 			if asg.curSize != tc.expectedCurSize {
@@ -2248,10 +2225,8 @@ func TestFullLifecycle_ScaleUpRegenerateScaleDown(t *testing.T) {
 	}
 	t.Logf("Phase 1 complete: curSize=%d", asg.curSize)
 
-	// Phase 2: Instances appear in API as running; regenerate.
-	mock.setInstances(makeAPIInstances(asg, []string{
-		verda.StatusRunning, verda.StatusRunning, verda.StatusRunning,
-	}))
+	// Phase 2: The created instances appear in API as running; regenerate.
+	mock.setInstances(listedCreatedInstances(mock, verda.StatusRunning, ""))
 	err = asgs.regenerate()
 	if err != nil {
 		t.Fatalf("Phase 2 regenerate failed: %v", err)
@@ -2276,9 +2251,7 @@ func TestFullLifecycle_ScaleUpRegenerateScaleDown(t *testing.T) {
 	t.Logf("Phase 3 complete: curSize=%d", asg.curSize)
 
 	// Phase 4: Regenerate confirms deletion (API now shows 2)
-	mock.setInstances(makeAPIInstances(asg, []string{
-		verda.StatusRunning, verda.StatusRunning,
-	}))
+	mock.setInstances(listedCreatedInstances(mock, verda.StatusRunning, refs[0].Hostname))
 	err = asgs.regenerate()
 	if err != nil {
 		t.Fatalf("Phase 4 regenerate failed: %v", err)
@@ -2291,6 +2264,27 @@ func TestFullLifecycle_ScaleUpRegenerateScaleDown(t *testing.T) {
 		t.Errorf("Phase 4: expected 2 cached refs, got %d", len(refs))
 	}
 	t.Logf("Phase 4 complete: curSize=%d, cached=%d", asg.curSize, len(refs))
+}
+
+// listedCreatedInstances returns the instances created through mock as the API would list them,
+// omitting excludeHostname.
+func listedCreatedInstances(mock *mockDCService, status, excludeHostname string) []verda.Instance {
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+	var out []verda.Instance
+	for _, req := range mock.created {
+		if req.Hostname == excludeHostname {
+			continue
+		}
+		out = append(out, verda.Instance{
+			ID:          "mock-id-" + req.Hostname,
+			Hostname:    req.Hostname,
+			Description: req.Description,
+			Location:    req.LocationCode,
+			Status:      status,
+		})
+	}
+	return out
 }
 
 // TestDeleteNodes_ConcurrentMinSizeInvariant is a regression test for the
@@ -2521,38 +2515,216 @@ func providerIDFor(hostname string) string {
 	return fmt.Sprintf("%s%s/%s", testProviderPrefix, testLocation, hostname)
 }
 
-func TestBelongsToManagedAsg(t *testing.T) {
-	_, _, asgs := newTestEnv(t)
-
-	// categorizeInstancesForAsg uses EqualFold to compare the hostname prefix
-	// to asg.hostnamePrefix, so the sweep must match that behaviour.
-	var b strings.Builder
-	for i, r := range testHostnamePrefix {
-		if i%2 == 0 {
-			b.WriteString(strings.ToUpper(string(r)))
-		} else {
-			b.WriteString(string(r))
-		}
-	}
-	mixedCasePrefix := b.String()
+func TestCategorizeInstancesForAsg_Ownership(t *testing.T) {
+	_, asg, asgs := newTestEnv(t)
+	hostname := fmt.Sprintf("%s-vm-fin-01-0000000a", testHostnamePrefix)
 
 	cases := []struct {
-		name     string
-		hostname string
-		want     bool
+		name        string
+		description string
+		wantAdopted bool
 	}{
-		{"known prefix matches", fmt.Sprintf("%s-vm-fin-01-abc", testHostnamePrefix), true},
-		{"prefix case differs from config", fmt.Sprintf("%s-vm-fin-01-abc", mixedCasePrefix), true},
-		{"foreign prefix rejected", "controlplane-vm-fin-01-abc", false},
-		{"malformed hostname rejected", "not-a-verda-hostname", false},
-		{"empty hostname rejected", "", false},
+		{"marker naming this cluster", ownershipMarker(testClusterName, asg.Name), true},
+		{"marker naming another cluster", ownershipMarker("other-cluster", asg.Name), false},
+		{"legacy: empty description", "", true},
+		{"legacy: description is the group name", asg.Name, true},
+		{"unrelated description", "hand-made VM", false},
+		{"marker without cluster field", ownershipMarkerPrefix + " group=" + asg.Name, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := asgs.belongsToManagedAsg(tc.hostname)
-			if got != tc.want {
-				t.Errorf("belongsToManagedAsg(%q) = %v, want %v", tc.hostname, got, tc.want)
+			inst := verda.Instance{ID: "i-1", Hostname: hostname, Description: tc.description, Status: verda.StatusRunning, Location: testLocation}
+			active, _, seen := asgs.categorizeInstancesForAsg([]verda.Instance{inst}, asg)
+			if got := len(active) == 1 && seen[hostname]; got != tc.wantAdopted {
+				t.Errorf("adopted=%v, want %v", got, tc.wantAdopted)
 			}
 		})
+	}
+}
+
+func TestRegenerate_NeverAdoptsOrCleansUpOtherClusterVMs(t *testing.T) {
+	mock, asg, asgs := newTestEnvWithMock(t)
+	foreign := []verda.Instance{
+		{ID: "f-1", Hostname: testHostnamePrefix + "-vm-fin-01-00000001", Description: ownershipMarker("other-cluster", asg.Name), Status: verda.StatusRunning, Location: testLocation},
+		{ID: "f-2", Hostname: testHostnamePrefix + "-vm-fin-01-00000002", Description: ownershipMarker("other-cluster", asg.Name), Status: verda.StatusError, Location: testLocation},
+	}
+	mock.setInstances(foreign)
+
+	for range 2 {
+		if err := asgs.regenerate(); err != nil {
+			t.Fatalf("regenerate: %v", err)
+		}
+	}
+	if len(asgs.failedInstances) != 0 {
+		t.Errorf("foreign failed VMs must not be tracked for cleanup: %v", asgs.failedInstances)
+	}
+
+	refs, _ := asgs.InstanceRefsForAsg(asg.AsgRef)
+	if len(refs) != 0 || asg.curSize != 0 {
+		t.Errorf("foreign VMs adopted: refs=%v curSize=%d", refs, asg.curSize)
+	}
+	if len(mock.actions) != 0 {
+		t.Errorf("foreign VMs must never be deleted, got actions %v", mock.actions)
+	}
+}
+
+func TestRegenerate_PendingCreateKeptWithinGraceThenDropped(t *testing.T) {
+	mock, asg, asgs := newTestEnvWithMock(t)
+	asgs.cfg.Image = imageConfig{GPU: "gpu-img", CPU: "cpu-img"}
+	asgs.cfg.StartupScript = base64.StdEncoding.EncodeToString([]byte("#!/bin/bash"))
+	mock.availLocation = testLocation
+
+	if err := asgs.scaleUpAsg(asg, 1); err != nil {
+		t.Fatalf("scale-up: %v", err)
+	}
+
+	// Not listed yet, within grace: kept.
+	if err := asgs.regenerate(); err != nil {
+		t.Fatalf("regenerate: %v", err)
+	}
+	if refs, _ := asgs.InstanceRefsForAsg(asg.AsgRef); len(refs) != 1 || asg.curSize != 1 {
+		t.Fatalf("within grace: refs=%d curSize=%d, want 1/1", len(refs), asg.curSize)
+	}
+
+	// Still not listed after the grace period: dropped, curSize follows.
+	asgs.cacheMutex.Lock()
+	for hostname, p := range asgs.pendingCreates {
+		p.createdAt = time.Now().Add(-pendingInstanceGracePeriod - time.Minute)
+		asgs.pendingCreates[hostname] = p
+	}
+	asgs.cacheMutex.Unlock()
+	if err := asgs.regenerate(); err != nil {
+		t.Fatalf("regenerate: %v", err)
+	}
+	if refs, _ := asgs.InstanceRefsForAsg(asg.AsgRef); len(refs) != 0 || asg.curSize != 0 {
+		t.Errorf("after grace: refs=%d curSize=%d, want 0/0", len(refs), asg.curSize)
+	}
+	if len(asgs.pendingCreates) != 0 {
+		t.Errorf("expired pending entries not pruned: %v", asgs.pendingCreates)
+	}
+}
+
+func TestRegenerate_RestoresPendingCreateMissingFromCache(t *testing.T) {
+	// A regenerate that swaps in a snapshot taken before a concurrent scale-up recorded its VM
+	// must not lose that VM: pendingCreates is the source of truth until the API lists it.
+	mock, asg, asgs := newTestEnvWithMock(t)
+	asgs.cfg.Image = imageConfig{GPU: "gpu-img", CPU: "cpu-img"}
+	asgs.cfg.StartupScript = base64.StdEncoding.EncodeToString([]byte("#!/bin/bash"))
+	mock.availLocation = testLocation
+	if err := asgs.scaleUpAsg(asg, 1); err != nil {
+		t.Fatalf("scale-up: %v", err)
+	}
+
+	asgs.cacheMutex.Lock()
+	asgs.asgToInstances = map[AsgRef][]InstanceRef{}
+	asgs.instanceToAsg = map[InstanceRef]*Asg{}
+	asgs.cacheMutex.Unlock()
+
+	if err := asgs.regenerate(); err != nil {
+		t.Fatalf("regenerate: %v", err)
+	}
+	if refs, _ := asgs.InstanceRefsForAsg(asg.AsgRef); len(refs) != 1 {
+		t.Errorf("pending VM lost: refs=%d, want 1", len(refs))
+	}
+}
+
+func TestScaleUp_CreateRequestOwnershipAndSpotVolumes(t *testing.T) {
+	for _, spot := range []bool{false, true} {
+		t.Run(fmt.Sprintf("spot=%t", spot), func(t *testing.T) {
+			mock, asg, asgs := newTestEnvWithMock(t)
+			asgs.cfg.Image = imageConfig{GPU: "gpu-img", CPU: "cpu-img"}
+			asgs.cfg.StartupScript = base64.StdEncoding.EncodeToString([]byte("#!/bin/bash"))
+			group := asgs.cfg.Groups[testAsgName]
+			group.AdditionalVolumes = []additionalVolume{{Name: "data", Size: 100, Type: "NVMe"}}
+			if spot {
+				group.BillingConfig = &billingConfig{Contract: BillingContractSpot}
+			}
+			asgs.cfg.Groups[testAsgName] = group
+			mock.availLocation = testLocation
+
+			if err := asgs.scaleUpAsg(asg, 1); err != nil {
+				t.Fatalf("scale-up: %v", err)
+			}
+
+			req := mock.created[0]
+			if want := ownershipMarker(testClusterName, testAsgName); req.Description != want {
+				t.Errorf("Description = %q, want %q", req.Description, want)
+			}
+			wantPolicy := ""
+			if spot {
+				wantPolicy = verda.SpotDiscontinueDeletePermanent
+			}
+			if req.OSVolume.OnSpotDiscontinue != wantPolicy || req.Volumes[0].OnSpotDiscontinue != wantPolicy {
+				t.Errorf("OnSpotDiscontinue os=%q data=%q, want %q", req.OSVolume.OnSpotDiscontinue, req.Volumes[0].OnSpotDiscontinue, wantPolicy)
+			}
+			if len(mock.availIsSpot) != 1 || mock.availIsSpot[0] != spot {
+				t.Errorf("availability checked with isSpot=%v, want [%t]", mock.availIsSpot, spot)
+			}
+		})
+	}
+}
+
+func TestScaleUp_StartupScriptGetsKubeletLabelsAndTaints(t *testing.T) {
+	mock, asg, asgs := newTestEnvWithMock(t)
+	asgs.cfg.Image = imageConfig{GPU: "gpu-img", CPU: "cpu-img"}
+	asgs.cfg.StartupScript = base64.StdEncoding.EncodeToString([]byte("labels={{.NodeLabels}} taints={{.NodeTaints}}"))
+	asgs.cfg.Labels = []string{"team=ml"}
+	group := asgs.cfg.Groups[testAsgName]
+	group.Taints = []apiv1.Taint{{Key: "dedicated", Value: "gpu", Effect: apiv1.TaintEffectNoSchedule}, {Key: "nvidia.com/gpu", Effect: apiv1.TaintEffectNoExecute}}
+	asgs.cfg.Groups[testAsgName] = group
+	mock.availLocation = testLocation
+
+	if err := asgs.scaleUpAsg(asg, 1); err != nil {
+		t.Fatalf("scale-up: %v", err)
+	}
+
+	want := "labels=team=ml,verda.com/accelerator=" + testInstanceType + ",verda.com/node-group=" + testAsgName +
+		" taints=dedicated=gpu:NoSchedule,nvidia.com/gpu:NoExecute"
+	if got := mock.createdScripts[0].Script; got != want {
+		t.Errorf("rendered script:\n got %q\nwant %q", got, want)
+	}
+}
+
+func TestParseASGNodeGroupSpecs_RejectsAmbiguousGroups(t *testing.T) {
+	cases := []struct {
+		name  string
+		specs []string
+	}{
+		{"duplicate name", []string{"0:1:CPU.4V:pool-a", "0:2:CPU.4V:pool-a"}},
+		{"duplicate name with distinct prefixes", []string{"0:1:CPU.4V:pool-a:p1", "0:2:CPU.4V:pool-a:p2"}},
+		{"prefix equals another group's name", []string{"0:1:CPU.4V:pool-a", "0:2:CPU.4V:pool-b:pool-a"}},
+		{"shared hostname prefix", []string{"0:1:CPU.4V:pool-a:shared", "0:2:CPU.4V:pool-b:shared"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			asgs := &autoScalingGroups{
+				registeredAsgs:    make(map[AsgRef]*Asg),
+				asgNodeGroupSpecs: make(map[AsgRef]string),
+				cfg:               &cloudConfig{ClusterName: testClusterName},
+			}
+			if err := asgs.parseASGNodeGroupSpecs(tc.specs); err == nil {
+				t.Errorf("expected error for %v", tc.specs)
+			}
+		})
+	}
+}
+
+func TestDeleteInstance_FailedDeleteKeepsInstanceAndSize(t *testing.T) {
+	mock, asg, asgs := newTestEnvWithMock(t)
+	asg.curSize = 2
+	refs := createTestInstanceRefs(t, 2)
+	asgs.updateCacheWithInstances(asg, toCreateResults(refs))
+	mock.actionFunc = func(_ context.Context, _, _ string) error {
+		return fmt.Errorf("delete instance test-id-0 failed: status=500 error=%q", "boom")
+	}
+
+	if err := asgs.DeleteInstance(refs[0]); err == nil {
+		t.Fatal("expected error from failed delete")
+	}
+	if asg.curSize != 2 {
+		t.Errorf("curSize = %d, want 2 (failed delete must not shrink the group)", asg.curSize)
+	}
+	if cached, _ := asgs.InstanceRefsForAsg(asg.AsgRef); len(cached) != 2 {
+		t.Errorf("cached refs = %d, want 2", len(cached))
 	}
 }
