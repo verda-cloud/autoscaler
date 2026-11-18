@@ -123,7 +123,7 @@ func deleteTestServer(t *testing.T, actionStatus int, actionBody any, got *verda
 	}
 }
 
-func TestWrapperDeleteInstance_DeletesOSAndAdditionalVolumes(t *testing.T) {
+func TestWrapperDeleteInstance_DeletesOnlyTheOSVolume(t *testing.T) {
 	var got verda.InstanceActionRequest
 	w := newHTTPTestWrapper(t, deleteTestServer(t, http.StatusAccepted,
 		[]verda.InstanceActionResult{{Action: "delete", InstanceID: "i-1", Status: "ok"}}, &got))
@@ -134,8 +134,41 @@ func TestWrapperDeleteInstance_DeletesOSAndAdditionalVolumes(t *testing.T) {
 	if got.Action != verda.ActionDelete || !slices.Equal(got.ID, []string{"i-1"}) {
 		t.Errorf("action request = %+v", got)
 	}
-	if !slices.Equal(got.VolumeIDs, []string{"os-1", "data-1"}) || !got.DeletePermanently {
-		t.Errorf("volumes = %v deletePermanently = %t, want [os-1 data-1] true", got.VolumeIDs, got.DeletePermanently)
+	if !slices.Equal(got.VolumeIDs, []string{"os-1"}) || !got.DeletePermanently {
+		t.Errorf("volumes = %v deletePermanently = %t, want [os-1] true (data-1 must be kept)", got.VolumeIDs, got.DeletePermanently)
+	}
+}
+
+// An instance missing from the list, or listed without an OS volume, is deleted with the API
+// default (no volume list); additional volumes are never named in the request.
+func TestWrapperDeleteInstance_UnknownOSVolumeSendsNoVolumeList(t *testing.T) {
+	for _, instanceID := range []string{"i-not-listed", "i-no-os-volume"} {
+		t.Run(instanceID, func(t *testing.T) {
+			var got verda.InstanceActionRequest
+			w := newHTTPTestWrapper(t, func(rw http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodGet && r.URL.Path == "/instances":
+					writeJSON(t, rw, http.StatusOK, []map[string]any{{
+						"id": "i-no-os-volume", "hostname": "pool-vm-fin-01-00000002", "status": "running",
+						"volume_ids": []string{"data-2"},
+					}})
+				case r.Method == http.MethodPut && r.URL.Path == "/instances":
+					if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+						t.Errorf("decode action request: %v", err)
+					}
+					writeJSON(t, rw, http.StatusAccepted, []verda.InstanceActionResult{{Action: "delete", InstanceID: instanceID, Status: "ok"}})
+				default:
+					http.NotFound(rw, r)
+				}
+			})
+
+			if err := w.DeleteInstance(context.Background(), instanceID); err != nil {
+				t.Fatalf("DeleteInstance: %v", err)
+			}
+			if !slices.Equal(got.ID, []string{instanceID}) || len(got.VolumeIDs) != 0 {
+				t.Errorf("action request = %+v, want id [%s] and no volume IDs", got, instanceID)
+			}
+		})
 	}
 }
 
