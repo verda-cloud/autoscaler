@@ -21,7 +21,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -85,7 +84,7 @@ type dcService interface {
 	ListInstancesCached(ctx context.Context) ([]verda.Instance, error)
 	GetInstanceByHostname(ctx context.Context, hostname string) (*verda.Instance, error)
 	CreateInstance(ctx context.Context, req *verda.CreateInstanceRequest) (*verda.Instance, error)
-	// DeleteInstance deletes the VM together with its OS and additional volumes.
+	// DeleteInstance deletes the VM and its OS volume; additional volumes are detached and kept.
 	// An instance the API reports as already gone (404) counts as deleted.
 	DeleteInstance(ctx context.Context, instanceID string) error
 	GetInstanceAvailabilityLocation(ctx context.Context, instanceType string, isSpot bool, locations []string) (string, error)
@@ -268,9 +267,9 @@ func (w *verdacloudWrapper) CreateInstance(ctx context.Context, req *verda.Creat
 }
 
 func (w *verdacloudWrapper) DeleteInstance(ctx context.Context, instanceID string) error {
-	volumeIDs, err := w.volumeIDsOf(ctx, instanceID)
+	volumeIDs, err := w.osVolumeIDOf(ctx, instanceID)
 	if err != nil {
-		return fmt.Errorf("delete instance %s: resolve volumes: %w", instanceID, err)
+		return fmt.Errorf("delete instance %s: resolve OS volume: %w", instanceID, err)
 	}
 
 	actionCtx, cancel := withAPIDeadline(ctx)
@@ -298,29 +297,19 @@ func (w *verdacloudWrapper) DeleteInstance(ctx context.Context, instanceID strin
 	return nil
 }
 
-// volumeIDsOf returns the OS and additional volume IDs attached to instanceID. Nil (API default:
-// OS volume deleted, others detached) when the instance is not in the list.
-func (w *verdacloudWrapper) volumeIDsOf(ctx context.Context, instanceID string) ([]string, error) {
+// osVolumeIDOf returns the OS volume ID of instanceID as the delete action's volume list: only
+// the OS volume is deleted, because additional volumes may hold data the autoscaler does not own.
+// Nil (API default: OS volume deleted, others detached) when the instance or its OS volume is unknown.
+func (w *verdacloudWrapper) osVolumeIDOf(ctx context.Context, instanceID string) ([]string, error) {
 	instances, err := w.ListInstancesCached(ctx)
 	if err != nil {
 		return nil, err
 	}
 	for _, inst := range instances {
-		if inst.ID != instanceID {
-			continue
+		if inst.ID == instanceID && inst.OSVolumeID != nil && *inst.OSVolumeID != "" {
+			return []string{*inst.OSVolumeID}, nil
 		}
-		var ids []string
-		if inst.OSVolumeID != nil && *inst.OSVolumeID != "" {
-			ids = append(ids, *inst.OSVolumeID)
-		}
-		for _, id := range inst.VolumeIDs {
-			if id != "" && !slices.Contains(ids, id) {
-				ids = append(ids, id)
-			}
-		}
-		return ids, nil
 	}
-	klog.Warningf("Delete instance %s: not in instance list; additional volumes (if any) will be detached, not deleted", instanceID)
 	return nil, nil
 }
 

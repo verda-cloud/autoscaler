@@ -275,7 +275,7 @@ make push-image BUILD_TAGS=verdacloud TAG='dev' REGISTRY='verdacloud'
 - Several clusters in one Verda project: every VM whose hostname starts with a group's prefix is treated as that group's member. Give each cluster's node groups distinct names or `hostnamePrefix` values (for example `prd-gpu-h100` and `stg-gpu-h100`); within one cluster the autoscaler already rejects colliding prefixes at startup.
 - Offline VMs stay members of their group, so scale-down can remove them; the CCM keeps their Node with a shutdown taint.
 - A VM missing from the instance list is dropped from its group, except VMs this process created in the last 5 minutes (create→list lag).
-- Scale-down deletes the VM together with its OS volume and every additional volume, permanently (`delete_permanently`). Spot VMs are created with `on_spot_discontinue: delete_permanently` on their volumes. Do not store data you need on node volumes.
+- Scale-down deletes the VM and its OS volume, permanently (`delete_permanently`). Every other attached volume is detached and kept, whether it came from `additionalVolumes` or was attached by hand: volumes created through `additionalVolumes` therefore accumulate with each scale-down and must be cleaned up by the operator. Spot VMs are created with `on_spot_discontinue: delete_permanently` on their volumes, so a spot eviction does delete them. Do not store data you need on the OS volume.
 - Every Verda API call is bounded by a 60s timeout. Failed calls are not retried inside the provider; the autoscaler loop retries on its next pass.
 - ProviderID format: `verdacloud://<lowercase-location>/<hostname>`.
 
