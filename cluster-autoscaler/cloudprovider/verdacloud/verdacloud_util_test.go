@@ -17,8 +17,13 @@ limitations under the License.
 package verdacloud
 
 import (
+	"encoding/base64"
+	"encoding/json"
+	"os"
 	"strings"
 	"testing"
+
+	apiv1 "k8s.io/api/core/v1"
 )
 
 // Test constants for util tests
@@ -182,5 +187,124 @@ func TestRenderStartupScript_ConditionalAndLoop(t *testing.T) {
 	}
 	if string(got) != "" {
 		t.Errorf("expected empty output for empty token branch; got %q", got)
+	}
+}
+
+func TestParseAsgSpec_NameRoundTripsThroughHostname(t *testing.T) {
+	for _, name := range []string{"a", "pool1", "gpu-h100", "vm", "vm-pool", "a-vmx", "x-v-m"} {
+		t.Run(name, func(t *testing.T) {
+			for _, spec := range []string{"0:1:CPU.4V:" + name, "0:1:CPU.4V:base:" + name} {
+				got, err := parseAsgSpec(spec)
+				if err != nil {
+					t.Fatalf("parseAsgSpec(%q): %v", spec, err)
+				}
+				base := got.hostnamePrefix
+				if base == "" {
+					base = got.name
+				}
+				hostname := base + ASG_SEPARATOR + "fin-01-deadbeef"
+				parsed, err := extractAsgNameFromHostname(hostname)
+				if err != nil || parsed != base {
+					t.Errorf("hostname %q parses to (%q, %v), want %q", hostname, parsed, err, base)
+				}
+			}
+		})
+	}
+}
+
+func TestParseAsgSpec_RejectsNamesThatBreakHostnameParsing(t *testing.T) {
+	for _, name := range []string{"gpu.h100", "GPU", "Pool", "gpu_h100", "cpu-vm", "gpu-vm-pool", "-a", "a-", "a--vm"} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := parseAsgSpec("0:1:CPU.4V:" + name); err == nil {
+				t.Errorf("ASG name %q accepted", name)
+			}
+			if _, err := parseAsgSpec("0:1:CPU.4V:ok:" + name); err == nil {
+				t.Errorf("hostname prefix %q accepted", name)
+			}
+		})
+	}
+}
+
+func TestLocationFromProviderID(t *testing.T) {
+	cases := map[string]string{
+		"verdacloud://fin-01/host-vm-fin-01-1": "fin-01",
+		"verdacloud:///host":                   "",
+		"verdacloud://fin-01":                  "",
+		"aws:///us-east-1a/i-1":                "",
+		"":                                     "",
+	}
+	for in, want := range cases {
+		if got := locationFromProviderID(in); got != want {
+			t.Errorf("locationFromProviderID(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestKubeletFlags(t *testing.T) {
+	if got := kubeletNodeLabelsFlag(map[string]string{"b": "2", "a": "1"}); got != "a=1,b=2" {
+		t.Errorf("labels flag = %q", got)
+	}
+	if got := kubeletNodeLabelsFlag(nil); got != "" {
+		t.Errorf("empty labels flag = %q, want empty", got)
+	}
+	taints := []apiv1.Taint{
+		{Key: "z", Effect: apiv1.TaintEffectNoExecute},
+		{Key: "dedicated", Value: "gpu", Effect: apiv1.TaintEffectNoSchedule},
+	}
+	if got := kubeletTaintsFlag(taints); got != "dedicated=gpu:NoSchedule,z:NoExecute" {
+		t.Errorf("taints flag = %q", got)
+	}
+	if got := kubeletTaintsFlag(nil); got != "" {
+		t.Errorf("empty taints flag = %q, want empty", got)
+	}
+}
+
+// The shipped example startup script must hand the per-group labels and taints to kubelet;
+// otherwise real nodes miss the labels the template node advertises.
+func TestExampleStartupScriptPassesNodeLabelsAndTaintsToKubelet(t *testing.T) {
+	raw, err := os.ReadFile("examples/config.json")
+	if err != nil {
+		t.Fatalf("read example config: %v", err)
+	}
+	var cfg cloudConfig
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatalf("parse example config: %v", err)
+	}
+	script, err := base64.StdEncoding.DecodeString(cfg.StartupScript)
+	if err != nil {
+		t.Fatalf("decode startupScript: %v", err)
+	}
+
+	deployment, err := os.ReadFile("examples/cluster-autoscaler-deployment-example.yaml")
+	if err != nil {
+		t.Fatalf("read deployment example: %v", err)
+	}
+	if !strings.Contains(string(deployment), cfg.StartupScript) {
+		t.Error("deployment example embeds a different startupScript than examples/config.json")
+	}
+
+	base := StartupScriptTemplateData{MasterIP: "10.0.0.1", MasterPort: "6443", JoinToken: "REPLACE_ME_TOKEN", JoinHashFull: "sha256:REPLACE_ME"}
+
+	withTaints := base
+	withTaints.NodeLabels = "verda.com/node-group=gpu-pool"
+	withTaints.NodeTaints = "nvidia.com/gpu=present:NoSchedule"
+	out, err := renderStartupScript(script, withTaints)
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	for _, want := range []string{"--node-labels=verda.com/node-group=gpu-pool", "--register-with-taints=nvidia.com/gpu=present:NoSchedule", "--cloud-provider=external"} {
+		if !strings.Contains(string(out), want) {
+			t.Errorf("rendered script lacks %q", want)
+		}
+	}
+
+	noTaints := base
+	noTaints.NodeLabels = "verda.com/node-group=cpu-pool"
+	out, err = renderStartupScript(script, noTaints)
+	if err != nil {
+		t.Fatalf("render without taints: %v", err)
+	}
+	if strings.Contains(string(out), "--register-with-taints") {
+		t.Error("empty NodeTaints must not emit --register-with-taints")
 	}
 }

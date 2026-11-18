@@ -18,27 +18,21 @@ package verdacloud
 
 import (
 	"fmt"
+	"net/http"
 	"os"
-	"time"
 
-	"github.com/verda-cloud/verdacloud-sdk-go/pkg/verda"
+	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/verdacloud/verda-go"
 	klog "k8s.io/klog/v2"
 )
 
-const (
-	// Identifies the autoscaler in API requests.
-	autoscalerUserAgent = "cluster-autoscaler/verdacloud"
-
-	// Retry budget for transient SDK failures.
-	sdkMaxRetries     = 3
-	sdkInitialBackoff = time.Second
-)
+// Identifies the autoscaler in API requests.
+const autoscalerUserAgent = "cluster-autoscaler/verdacloud"
 
 type verdacloudSDKProvider struct {
 	client *verda.Client
 }
 
-func createVerdacloudSDKProvider(cfg *cloudConfig) (*verdacloudSDKProvider, error) {
+func createVerdacloudSDKProvider() (*verdacloudSDKProvider, error) {
 	clientID := os.Getenv("VERDA_CLIENT_ID")
 	clientSecret := os.Getenv("VERDA_CLIENT_SECRET")
 	baseURL := os.Getenv("VERDA_BASE_URL")
@@ -47,22 +41,12 @@ func createVerdacloudSDKProvider(cfg *cloudConfig) (*verdacloudSDKProvider, erro
 		return nil, fmt.Errorf("VERDA_CLIENT_ID and VERDA_CLIENT_SECRET environment variables must be set")
 	}
 
-	verdaDebug := os.Getenv("VERDA_DEBUG")
-	detailedDebugEnabled := verdaDebug == "true" || verdaDebug == "1"
-
-	var logger verda.Logger
-	if cfg.Debug || detailedDebugEnabled {
-		logger = verda.NewStdLogger(true)
-	} else {
-		logger = &verda.NoOpLogger{}
-	}
-
 	clientOpts := []verda.ClientOption{
 		verda.WithClientID(clientID),
 		verda.WithClientSecret(clientSecret),
-		verda.WithDebugLogging(cfg.Debug),
-		verda.WithLogger(logger),
 		verda.WithUserAgent(autoscalerUserAgent),
+		// Backstop for calls whose context carries no deadline; withAPIDeadline is the primary bound.
+		verda.WithHTTPClient(&http.Client{Timeout: apiCallTimeout}),
 	}
 
 	if baseURL != "" {
@@ -76,19 +60,5 @@ func createVerdacloudSDKProvider(cfg *cloudConfig) (*verdacloudSDKProvider, erro
 	if err != nil {
 		return nil, err
 	}
-
-	client.AddRequestMiddleware(
-		verda.ExponentialBackoffRetryMiddleware(sdkMaxRetries, sdkInitialBackoff, logger),
-	)
-
-	if detailedDebugEnabled {
-		verda.AddDetailedDebugLogging(client)
-		klog.V(4).Info("VerdaCloud SDK detailed debug logging enabled (VERDA_DEBUG=true)")
-	}
-
-	klog.V(4).Infof("VerdaCloud SDK client created with retry middleware enabled (max %d retries, exponential backoff from %s)", sdkMaxRetries, sdkInitialBackoff)
-
-	return &verdacloudSDKProvider{
-		client: client,
-	}, nil
+	return &verdacloudSDKProvider{client: client}, nil
 }

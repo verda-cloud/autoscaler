@@ -30,18 +30,20 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/verda-cloud/verdacloud-sdk-go/pkg/verda"
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
+	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/verdacloud/verda-go"
 	klog "k8s.io/klog/v2"
 )
 
 const (
 	verdacloudProviderIDPrefix = "verdacloud://"
-	defaultPodAmountsLimit     = 110
-	refreshInterval            = 1 * time.Minute // throttles API calls during rapid loops
+	// LabelLocation matches the CCM's verda.com/location label (lowercase location).
+	LabelLocation          = "verda.com/location"
+	defaultPodAmountsLimit = 110
+	refreshInterval        = 1 * time.Minute // throttles API calls during rapid loops
 )
 
 // VerdacloudManager manages Verdacloud resources for the cluster autoscaler.
@@ -70,7 +72,8 @@ type InstanceResource struct {
 	GPU          int64
 }
 
-func createVerdacloudManager(cloudReader io.Reader, discoveryOpts cloudprovider.NodeGroupDiscoveryOptions) (*VerdacloudManager, error) {
+// defaultClusterName (the autoscaler's --cluster-name) is used when the cloud config sets no clusterName.
+func createVerdacloudManager(cloudReader io.Reader, discoveryOpts cloudprovider.NodeGroupDiscoveryOptions, defaultClusterName string) (*VerdacloudManager, error) {
 	cfg := &cloudConfig{}
 	if cloudReader != nil {
 		decoder := json.NewDecoder(cloudReader)
@@ -79,8 +82,12 @@ func createVerdacloudManager(cloudReader io.Reader, discoveryOpts cloudprovider.
 		}
 	}
 
-	if !cfg.isValid() {
-		return nil, errors.New("invalid cloud configuration: please verify that image (GPU/CPU), sshKeyIDs, startupScript, and availableLocations are correctly specified in the cloud-config file")
+	if cfg.ClusterName == "" {
+		cfg.ClusterName = defaultClusterName
+	}
+
+	if err := cfg.validate(); err != nil {
+		return nil, err
 	}
 
 	cfg = verifyCloudConfigAndPatch(cfg)
@@ -98,7 +105,7 @@ func createVerdacloudManager(cloudReader io.Reader, discoveryOpts cloudprovider.
 		return nil, err
 	}
 
-	sdkProvider, err := createVerdacloudSDKProvider(cfg)
+	sdkProvider, err := createVerdacloudSDKProvider()
 	if err != nil {
 		return nil, err
 	}
@@ -137,19 +144,6 @@ func (m *VerdacloudManager) forceRefresh() error {
 	return nil
 }
 
-func (m *VerdacloudManager) allASGActiveInstances(ctx context.Context, asg *Asg) ([]verda.Instance, error) {
-	if asg.Name == "" {
-		return nil, errors.New("asgName is required")
-	}
-
-	instances, err := m.dcService.GetActiveInstancesForAsg(ctx, asg.Name, asg.hostnamePrefix)
-	if err != nil {
-		return nil, err
-	}
-
-	return instances, nil
-}
-
 // ScaleUpAsg scales up the ASG by the given delta.
 func (m *VerdacloudManager) ScaleUpAsg(asg *Asg, delta int) error {
 	return m.asgs.scaleUpAsg(asg, delta)
@@ -162,19 +156,6 @@ func (m *VerdacloudManager) getAsgs() []*Asg {
 // GetAsgByRef returns the ASG for the given reference.
 func (m *VerdacloudManager) GetAsgByRef(ref AsgRef) (*Asg, error) {
 	return m.asgs.GetAsgByRef(ref)
-}
-
-// GetAsgNodes returns the provider IDs of all nodes in the ASG.
-func (m *VerdacloudManager) GetAsgNodes(ctx context.Context, asg *Asg) ([]string, error) {
-	instances, err := m.allASGActiveInstances(ctx, asg)
-	if err != nil {
-		return nil, err
-	}
-	providerIDs := make([]string, 0, len(instances))
-	for _, inst := range instances {
-		providerIDs = append(providerIDs, formatProviderID(inst.Location, inst.Hostname))
-	}
-	return providerIDs, nil
 }
 
 // GetAsgForInstance returns the ASG that the given instance belongs to.
@@ -317,7 +298,8 @@ func (m *VerdacloudManager) getInstancesForAsg(ref AsgRef) ([]cloudprovider.Inst
 		providerID := formatProviderID(asgIns.Location, asgIns.Hostname)
 		status := strings.ToLower(asgIns.Status)
 		switch status {
-		case verda.StatusRunning:
+		// Offline VMs are group members whose Node the CCM keeps; reporting them as running lets scale-down remove them.
+		case verda.StatusRunning, verda.StatusOffline:
 			cloudInstances = append(cloudInstances, cloudprovider.Instance{
 				Id: providerID,
 				Status: &cloudprovider.InstanceStatus{
@@ -331,15 +313,18 @@ func (m *VerdacloudManager) getInstancesForAsg(ref AsgRef) ([]cloudprovider.Inst
 					State: cloudprovider.InstanceCreating,
 				},
 			})
-		case verda.StatusOffline, verda.StatusDiscontinued, verda.StatusNotFound, verda.StatusDeleting:
+		case verda.StatusDiscontinued, verda.StatusNotFound, verda.StatusDeleting:
 			cloudInstances = append(cloudInstances, cloudprovider.Instance{Id: providerID, Status: &cloudprovider.InstanceStatus{State: cloudprovider.InstanceDeleting}})
 		case verda.StatusError, verda.StatusNoCapacity, verda.StatusUnknown:
+			// clusterstate only acts on ErrorInfo when State is InstanceCreating.
 			cloudInstances = append(cloudInstances, cloudprovider.Instance{Id: providerID,
-				Status: &cloudprovider.InstanceStatus{ErrorInfo: &cloudprovider.InstanceErrorInfo{
-					ErrorClass:   cloudprovider.OtherErrorClass,
-					ErrorCode:    "verdacloud-instance-deployment-error",
-					ErrorMessage: status,
-				}}})
+				Status: &cloudprovider.InstanceStatus{
+					State: cloudprovider.InstanceCreating,
+					ErrorInfo: &cloudprovider.InstanceErrorInfo{
+						ErrorClass:   cloudprovider.OtherErrorClass,
+						ErrorCode:    "verdacloud-instance-deployment-error",
+						ErrorMessage: status,
+					}}})
 		default:
 			cloudInstances = append(cloudInstances, cloudprovider.Instance{Id: providerID})
 		}
@@ -349,19 +334,20 @@ func (m *VerdacloudManager) getInstancesForAsg(ref AsgRef) ([]cloudprovider.Inst
 
 func (m *VerdacloudManager) buildNodeFromTemplate(asg *Asg, template *asgTemplate) (*apiv1.Node, error) {
 	nodeName := fmt.Sprintf("asg-%s-%d", asg.Name, rand.Int63())
+	nodeCfg := m.cfg.GetNodeConfig(asg.Name)
 
+	// Kubelet-set labels, plus what the startup script passes via --node-labels.
 	labels := map[string]string{
-		"kubernetes.io/arch":               template.InstanceType.Arch,
-		"kubernetes.io/os":                 "linux",
-		"node.kubernetes.io/instance-type": template.InstanceType.InstanceType,
-		// Template-only fallback label; real node labels cannot contain commas.
-		// Single-location nodeSelectors will not match this simulated node.
-		"topology.kubernetes.io/location": strings.Join(asg.AvailabilityLocations, ","),
-		"verda.com/hostname":              asg.Name,
-		NodeGroupLabelKey:                 asg.Name,
+		"kubernetes.io/arch": template.InstanceType.Arch,
+		"kubernetes.io/os":   "linux",
 	}
-	if template.InstanceType.GPU > 0 {
-		labels[AcceleratorLabel] = template.InstanceType.InstanceType
+	for k, v := range registeredNodeLabels(asg, nodeCfg) {
+		labels[k] = v
+	}
+	// CCM-set labels (instance type from the API; region == zone == verda.com/location, lowercase).
+	labels["node.kubernetes.io/instance-type"] = template.InstanceType.InstanceType
+	for k, v := range ccmLocationLabels(asg.AvailabilityLocations) {
+		labels[k] = v
 	}
 
 	capacity := apiv1.ResourceList{
@@ -382,18 +368,47 @@ func (m *VerdacloudManager) buildNodeFromTemplate(asg *Asg, template *asgTemplat
 		},
 	}
 
-	nodeCfg := m.cfg.GetNodeConfig(asg.Name)
-	for _, l := range nodeCfg.Labels {
-		if parts := strings.SplitN(l, "=", 2); len(parts) == 2 {
-			node.Labels[parts[0]] = parts[1]
-		}
-	}
 	for k, v := range template.Tags {
 		node.Labels[k] = v
 	}
 	node.Spec.Taints = append([]apiv1.Taint(nil), nodeCfg.Taints...)
 
 	return node, nil
+}
+
+// registeredNodeLabels are the labels a real node of asg registers with (kubelet --node-labels).
+// The template node carries the same set, so a pod that fits the template fits the real node.
+// Provider keys win over config labels with the same key.
+func registeredNodeLabels(asg *Asg, nodeCfg *nodeConfig) map[string]string {
+	labels := make(map[string]string, len(nodeCfg.Labels)+2)
+	for _, l := range nodeCfg.Labels {
+		if k, v, ok := strings.Cut(l, "="); ok {
+			labels[k] = v
+		}
+	}
+	labels[NodeGroupLabelKey] = asg.Name
+	if nodeCfg.ClusterName != "" {
+		labels[ClusterLabelKey] = nodeCfg.ClusterName
+	}
+	if isGPUInstanceType(asg.instanceType) {
+		labels[AcceleratorLabel] = asg.instanceType
+	}
+	return labels
+}
+
+// ccmLocationLabels mirrors the topology labels verdacloud-cloud-controller-manager sets.
+// A multi-location group cannot know where its next VM lands, so it advertises none: claiming
+// one would let a location-pinned pod trigger a scale-up that lands elsewhere.
+func ccmLocationLabels(locations []string) map[string]string {
+	if len(locations) != 1 {
+		return nil
+	}
+	loc := strings.ToLower(locations[0])
+	return map[string]string{
+		apiv1.LabelTopologyRegion: loc,
+		apiv1.LabelTopologyZone:   loc,
+		LabelLocation:             loc,
+	}
 }
 
 func (m *VerdacloudManager) getAsgTemplate(ctx context.Context, asgRef AsgRef) (*asgTemplate, error) {

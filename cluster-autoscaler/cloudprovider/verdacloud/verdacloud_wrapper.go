@@ -18,12 +18,14 @@ package verdacloud
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/verda-cloud/verdacloud-sdk-go/pkg/verda"
+	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/verdacloud/verda-go"
 	klog "k8s.io/klog/v2"
 )
 
@@ -31,7 +33,16 @@ const (
 	// instanceCacheTTL bounds instance cache freshness across autoscaler scan cycles.
 	// Mutating operations invalidate the cache so subsequent reads observe fresh data.
 	instanceCacheTTL = 1 * time.Minute
+
+	// apiCallTimeout bounds every Verda API call (including token refresh) so a hung
+	// connection cannot stall Refresh() or hold an ASG's scaleMutex indefinitely.
+	apiCallTimeout = 60 * time.Second
 )
+
+// withAPIDeadline derives the per-call context used for every Verda API request.
+func withAPIDeadline(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, apiCallTimeout)
+}
 
 // instanceCache holds cached instance data with expiration
 type instanceCache struct {
@@ -72,11 +83,11 @@ func (c *instanceCache) invalidate() {
 type dcService interface {
 	ListInstancesCached(ctx context.Context) ([]verda.Instance, error)
 	GetInstanceByHostname(ctx context.Context, hostname string) (*verda.Instance, error)
-	GetActiveInstancesForAsg(ctx context.Context, asgName string, hostnamePrefix ...string) ([]verda.Instance, error)
 	CreateInstance(ctx context.Context, req *verda.CreateInstanceRequest) (*verda.Instance, error)
+	// DeleteInstance deletes the VM and its OS volume; additional volumes are detached and kept.
+	// An instance the API reports as already gone (404) counts as deleted.
 	DeleteInstance(ctx context.Context, instanceID string) error
-	PerformInstanceAction(ctx context.Context, instanceID, action string) error
-	GetInstanceAvailabilityLocation(ctx context.Context, instanceType string, locations []string) (string, error)
+	GetInstanceAvailabilityLocation(ctx context.Context, instanceType string, isSpot bool, locations []string) (string, error)
 	CreateStartScript(ctx context.Context, name, script string) (*verda.StartupScript, error)
 	DeleteStartScript(ctx context.Context, id string) error
 	ListInstanceTypes(ctx context.Context) ([]string, error)
@@ -116,34 +127,49 @@ func (w *verdacloudWrapper) cacheType(instanceType string, res *InstanceResource
 	w.typeCache[strings.ToUpper(instanceType)] = res
 }
 
+// isActiveStatus reports whether a VM counts as a node-group member. Offline VMs
+// are members: the CCM keeps their Node (shutdown-tainted), so scale-down must be able to remove them.
 func isActiveStatus(status string) bool {
 	switch strings.ToLower(status) {
 	case verda.StatusNew, verda.StatusOrdered, verda.StatusProvisioning,
-		verda.StatusValidating, verda.StatusRunning, verda.StatusPending:
+		verda.StatusValidating, verda.StatusRunning, verda.StatusPending,
+		verda.StatusOffline:
 		return true
 	}
 	return false
 }
 
-func (w *verdacloudWrapper) GetInstanceAvailabilityLocation(ctx context.Context, instanceType string, locations []string) (string, error) {
+// GetInstanceAvailabilityLocation returns the first location with capacity, or "" when every
+// location answered "unavailable". API failures are returned, never reported as "no capacity".
+func (w *verdacloudWrapper) GetInstanceAvailabilityLocation(ctx context.Context, instanceType string, isSpot bool, locations []string) (string, error) {
 	if len(locations) == 0 {
 		return "", fmt.Errorf("locations is empty")
 	}
 
+	var errs []error
 	for _, loc := range locations {
 		al := strings.ToUpper(loc)
-		available, err := w.client.InstanceAvailability.GetInstanceTypeAvailability(ctx, instanceType, false, al)
+		available, err := w.checkAvailability(ctx, instanceType, isSpot, al)
 		if err != nil {
-			klog.V(5).Infof("Error checking availability for %s in %s: %v", instanceType, al, err)
+			errs = append(errs, fmt.Errorf("check availability of %s (spot=%t) in %s: %w", instanceType, isSpot, al, err))
 			continue
 		}
 		if available {
-			klog.V(4).Infof("Instance type %s available in %s", instanceType, al)
+			klog.V(4).Infof("Instance type %s (spot=%t) available in %s", instanceType, isSpot, al)
 			return al, nil
 		}
 	}
-	klog.Warningf("Instance type %s not available in any location", instanceType)
+	if len(errs) > 0 {
+		return "", errors.Join(errs...)
+	}
+	klog.Warningf("Instance type %s (spot=%t) not available in any location", instanceType, isSpot)
 	return "", nil
+}
+
+func (w *verdacloudWrapper) checkAvailability(ctx context.Context, instanceType string, isSpot bool, location string) (bool, error) {
+	ctx, cancel := withAPIDeadline(ctx)
+	defer cancel()
+	return w.client.InstanceAvailability.GetInstanceTypeAvailability(ctx, instanceType, isSpot, location)
 }
 
 // GetInstanceTypeDetails returns CPU/memory/GPU for the given instance type.
@@ -155,6 +181,8 @@ func (w *verdacloudWrapper) GetInstanceTypeDetails(ctx context.Context, instance
 		return nil, fmt.Errorf("instance type is empty")
 	}
 
+	ctx, cancel := withAPIDeadline(ctx)
+	defer cancel()
 	allInstanceTypes, err := w.client.InstanceTypes.Get(ctx, "")
 	if err != nil {
 		if cached := w.lookupTypeCache(instanceType); cached != nil {
@@ -195,6 +223,8 @@ func (w *verdacloudWrapper) ListInstancesCached(ctx context.Context) ([]verda.In
 		return cached, nil
 	}
 
+	ctx, cancel := withAPIDeadline(ctx)
+	defer cancel()
 	instances, err := w.client.Instances.Get(ctx, "")
 	if err != nil {
 		return nil, fmt.Errorf("list instances failed: %w", err)
@@ -223,36 +253,9 @@ func (w *verdacloudWrapper) GetInstanceByHostname(ctx context.Context, hostname 
 	return nil, fmt.Errorf("instance %s not found", hostname)
 }
 
-func (w *verdacloudWrapper) GetActiveInstancesForAsg(ctx context.Context, asgName string, hostnamePrefix ...string) ([]verda.Instance, error) {
-	instances, err := w.ListInstancesCached(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	matchKey := asgName
-	if len(hostnamePrefix) > 0 && hostnamePrefix[0] != "" {
-		matchKey = hostnamePrefix[0]
-	}
-
-	filtered := make([]verda.Instance, 0)
-	for _, inst := range instances {
-		if !isActiveStatus(inst.Status) {
-			continue
-		}
-		extractedPrefix, err := extractAsgNameFromHostname(inst.Hostname)
-		if err != nil {
-			continue
-		}
-		if strings.EqualFold(extractedPrefix, matchKey) {
-			filtered = append(filtered, inst)
-		}
-	}
-
-	klog.V(4).Infof("GetActiveInstancesForAsg %s: found %d instances", asgName, len(filtered))
-	return filtered, nil
-}
-
 func (w *verdacloudWrapper) CreateInstance(ctx context.Context, req *verda.CreateInstanceRequest) (*verda.Instance, error) {
+	ctx, cancel := withAPIDeadline(ctx)
+	defer cancel()
 	instance, err := w.client.Instances.Create(ctx, *req)
 	if err != nil {
 		return nil, fmt.Errorf("create instance %s failed: %w", req.Hostname, err)
@@ -263,29 +266,79 @@ func (w *verdacloudWrapper) CreateInstance(ctx context.Context, req *verda.Creat
 	return instance, nil
 }
 
-func (w *verdacloudWrapper) PerformInstanceAction(ctx context.Context, instanceID, action string) error {
-	_, err := w.client.Instances.Action(ctx, verda.InstanceActionRequest{
-		Action: action,
-		ID:     []string{instanceID},
-	})
-	if err == nil {
-		// Invalidate cache after action that may change instance state
-		w.InvalidateCache()
-	}
-	return err
-}
-
 func (w *verdacloudWrapper) DeleteInstance(ctx context.Context, instanceID string) error {
-	if err := w.client.Instances.Delete(ctx, []string{instanceID}, nil, false); err != nil {
+	volumeIDs, err := w.osVolumeIDOf(ctx, instanceID)
+	if err != nil {
+		return fmt.Errorf("delete instance %s: resolve OS volume: %w", instanceID, err)
+	}
+
+	actionCtx, cancel := withAPIDeadline(ctx)
+	defer cancel()
+	results, err := w.client.Instances.Action(actionCtx, verda.InstanceActionRequest{
+		Action:            verda.ActionDelete,
+		ID:                []string{instanceID},
+		VolumeIDs:         volumeIDs,
+		DeletePermanently: true,
+	})
+	if err != nil {
+		if isAPINotFound(err) {
+			klog.V(4).Infof("Delete instance %s: already gone (404)", instanceID)
+			w.InvalidateCache()
+			return nil
+		}
 		return fmt.Errorf("delete instance %s failed: %w", instanceID, err)
 	}
-	// Invalidate cache after deletion
+	if err := instanceActionError(instanceID, results); err != nil {
+		return err
+	}
+
 	w.InvalidateCache()
-	klog.V(4).Infof("Deleted instance: id=%s", instanceID)
+	klog.V(4).Infof("Deleted instance: id=%s volumes=%v", instanceID, volumeIDs)
 	return nil
 }
 
+// osVolumeIDOf returns the OS volume ID of instanceID as the delete action's volume list: only
+// the OS volume is deleted, because additional volumes may hold data the autoscaler does not own.
+// Nil (API default: OS volume deleted, others detached) when the instance or its OS volume is unknown.
+func (w *verdacloudWrapper) osVolumeIDOf(ctx context.Context, instanceID string) ([]string, error) {
+	instances, err := w.ListInstancesCached(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, inst := range instances {
+		if inst.ID == instanceID && inst.OSVolumeID != nil && *inst.OSVolumeID != "" {
+			return []string{*inst.OSVolumeID}, nil
+		}
+	}
+	return nil, nil
+}
+
+// instanceActionError converts a per-instance failure in a 202/207 action response into an error.
+// A per-instance 404 means the instance is already gone and is not an error.
+func instanceActionError(instanceID string, results []verda.InstanceActionResult) error {
+	for _, r := range results {
+		if r.InstanceID != instanceID {
+			continue
+		}
+		if r.Error == "" && r.StatusCode < http.StatusBadRequest {
+			return nil
+		}
+		if r.StatusCode == http.StatusNotFound {
+			return nil
+		}
+		return fmt.Errorf("delete instance %s failed: status=%d error=%q", instanceID, r.StatusCode, r.Error)
+	}
+	return nil
+}
+
+func isAPINotFound(err error) bool {
+	var apiErr *verda.APIError
+	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound
+}
+
 func (w *verdacloudWrapper) CreateStartScript(ctx context.Context, name, script string) (*verda.StartupScript, error) {
+	ctx, cancel := withAPIDeadline(ctx)
+	defer cancel()
 	req := verda.CreateStartupScriptRequest{Name: name, Script: script}
 	startupScript, err := w.client.StartupScripts.AddStartupScript(ctx, &req)
 	if err != nil {
@@ -295,14 +348,17 @@ func (w *verdacloudWrapper) CreateStartScript(ctx context.Context, name, script 
 }
 
 func (w *verdacloudWrapper) DeleteStartScript(ctx context.Context, id string) error {
+	ctx, cancel := withAPIDeadline(ctx)
+	defer cancel()
 	if err := w.client.StartupScripts.DeleteStartupScript(ctx, id); err != nil {
-		klog.Warningf("delete startup script %s failed (script may leak on VerdaCloud side): %v", id, err)
-		return err
+		return fmt.Errorf("delete startup script %s: %w", id, err)
 	}
 	return nil
 }
 
 func (w *verdacloudWrapper) ListInstanceTypes(ctx context.Context) ([]string, error) {
+	ctx, cancel := withAPIDeadline(ctx)
+	defer cancel()
 	availabilities, err := w.client.InstanceAvailability.GetAllAvailabilities(ctx, false, "")
 	if err != nil {
 		return nil, err

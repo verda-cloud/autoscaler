@@ -18,6 +18,7 @@ package verdacloud
 
 import (
 	"sort"
+	"strings"
 	"testing"
 
 	apiv1 "k8s.io/api/core/v1"
@@ -29,6 +30,7 @@ import (
 // behavior and let the rest stay at sensible defaults.
 func minimalValidConfig() *cloudConfig {
 	return &cloudConfig{
+		ClusterName:        "test-cluster",
 		Image:              imageConfig{GPU: "gpu-image", CPU: "cpu-image"},
 		SSHKeyIDs:          []string{"key-1"},
 		BillingConfig:      billingConfig{Price: "DYNAMIC", Contract: "PAY_AS_YOU_GO"},
@@ -46,6 +48,7 @@ func TestCloudConfig_Validate(t *testing.T) {
 		{
 			name: "valid config",
 			cfg: cloudConfig{
+				ClusterName:        "test-cluster",
 				Image:              imageConfig{GPU: "gpu-image", CPU: "cpu-image"},
 				SSHKeyIDs:          []string{"key-1"},
 				StartupScript:      "base64script",
@@ -56,6 +59,7 @@ func TestCloudConfig_Validate(t *testing.T) {
 		{
 			name: "valid config without groups (groups is optional)",
 			cfg: cloudConfig{
+				ClusterName:        "test-cluster",
 				Image:              imageConfig{GPU: "gpu-image", CPU: "cpu-image"},
 				SSHKeyIDs:          []string{"key-1"},
 				StartupScript:      "base64script",
@@ -802,65 +806,54 @@ func intPtr(i int) *int {
 	return &i
 }
 
-func TestCloudConfig_IsValid(t *testing.T) {
-	tests := []struct {
-		name          string
-		cfg           cloudConfig
-		expectedValid bool
+// clusterName is optional; when set it must be a valid Kubernetes label value.
+func TestCloudConfig_ValidateClusterName(t *testing.T) {
+	cases := []struct {
+		clusterName string
+		wantErr     bool
 	}{
-		{
-			name: "valid config returns true",
-			cfg: cloudConfig{
-				Image:              imageConfig{GPU: "gpu-image", CPU: "cpu-image"},
-				SSHKeyIDs:          []string{"key-1"},
-				StartupScript:      "base64script",
-				AvailableLocations: []string{"FIN-01"},
-			},
-			expectedValid: true,
-		},
-		{
-			name: "missing image returns false",
-			cfg: cloudConfig{
-				SSHKeyIDs:          []string{"key-1"},
-				StartupScript:      "base64script",
-				AvailableLocations: []string{"FIN-01"},
-			},
-			expectedValid: false,
-		},
-		{
-			name: "missing ssh keys returns false",
-			cfg: cloudConfig{
-				Image:              imageConfig{GPU: "gpu-image"},
-				StartupScript:      "base64script",
-				AvailableLocations: []string{"FIN-01"},
-			},
-			expectedValid: false,
-		},
-		{
-			name: "missing startup script returns false",
-			cfg: cloudConfig{
-				Image:              imageConfig{GPU: "gpu-image"},
-				SSHKeyIDs:          []string{"key-1"},
-				AvailableLocations: []string{"FIN-01"},
-			},
-			expectedValid: false,
-		},
-		{
-			name: "missing locations returns false",
-			cfg: cloudConfig{
-				Image:         imageConfig{GPU: "gpu-image"},
-				SSHKeyIDs:     []string{"key-1"},
-				StartupScript: "base64script",
-			},
-			expectedValid: false,
-		},
+		{"prod-eu", false},
+		{"Prod.EU_1", false},
+		{"", false},
+		{"has space", true},
+		{"a=b", true},
+		{"-leading", true},
+		{strings.Repeat("a", 64), true},
 	}
+	for _, tc := range cases {
+		t.Run(tc.clusterName, func(t *testing.T) {
+			cfg := minimalValidConfig()
+			cfg.ClusterName = tc.clusterName
+			if err := cfg.validate(); (err != nil) != tc.wantErr {
+				t.Errorf("validate() err=%v, wantErr=%v", err, tc.wantErr)
+			}
+		})
+	}
+}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := tt.cfg.isValid()
-			if result != tt.expectedValid {
-				t.Errorf("Expected isValid()=%v, got %v", tt.expectedValid, result)
+func TestCloudConfig_ValidateKubeletLabels(t *testing.T) {
+	cases := []struct {
+		name        string
+		labels      []string
+		groupLabels []string
+		wantErr     bool
+	}{
+		{"plain and vendor labels", []string{"team=ml", "example.com/x=y"}, nil, false},
+		{"kubelet-allowed kubernetes.io label", []string{"kubernetes.io/arch=amd64"}, nil, false},
+		{"node-restriction namespace is admin-only", []string{"node-restriction.kubernetes.io/pool=a"}, nil, true},
+		{"node-role is kubelet-forbidden", []string{"node-role.kubernetes.io/gpu=true"}, nil, true},
+		{"k8s.io namespace is kubelet-forbidden", []string{"foo.k8s.io/x=y"}, nil, true},
+		{"forbidden label in a group", nil, []string{"node-role.kubernetes.io/gpu=true"}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := minimalValidConfig()
+			cfg.Labels = tc.labels
+			if tc.groupLabels != nil {
+				cfg.Groups = map[string]GroupConfig{"pool": {Labels: tc.groupLabels}}
+			}
+			if err := cfg.validate(); (err != nil) != tc.wantErr {
+				t.Errorf("validate() err=%v, wantErr=%v", err, tc.wantErr)
 			}
 		})
 	}

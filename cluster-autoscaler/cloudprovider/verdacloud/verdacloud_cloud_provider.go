@@ -32,6 +32,8 @@ import (
 const (
 	// NodeGroupLabelKey is the label key used to identify node groups.
 	NodeGroupLabelKey = "verda.com/node-group"
+	// ClusterLabelKey carries the optional clusterName; informational only.
+	ClusterLabelKey = "verda.com/cluster"
 	// AcceleratorLabel is the label key for GPU accelerator type.
 	AcceleratorLabel = "verda.com/accelerator"
 	// ResourceNvidiaGPU is the resource name for NVIDIA GPUs.
@@ -188,7 +190,7 @@ func BuildVerdacloud(
 		defer configFile.Close()
 	}
 
-	manager, err := createVerdacloudManager(configFile, do)
+	manager, err := createVerdacloudManager(configFile, do, opts.ClusterName)
 	if err != nil {
 		klog.Fatalf("Failed to create VerdaCloud manager: %v", err)
 	}
