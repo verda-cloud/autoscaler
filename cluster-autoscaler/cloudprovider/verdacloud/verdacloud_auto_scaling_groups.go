@@ -46,9 +46,6 @@ const (
 
 	// maxHostnameAttempts bounds regeneration of a random hostname suffix on collision.
 	maxHostnameAttempts = 5
-
-	// ownershipMarkerPrefix starts the VM Description written by ownershipMarker.
-	ownershipMarkerPrefix = "verda-ca"
 )
 
 // ASG_SEPARATOR is the separator pattern used to parse hostnames.
@@ -67,7 +64,7 @@ type autoScalingGroups struct {
 	instanceToAsg     map[InstanceRef]*Asg     // VM ref to ASG pointer
 	instanceIDs       map[InstanceRef]string   // Ref to API instance ID
 	asgNodeGroupSpecs map[AsgRef]string        // ASG to original spec string
-	cfg               *cloudConfig             // Global config pointer (ownership)
+	cfg               *cloudConfig             // Global config pointer
 	dcService         dcService                // VerdaCloud API wrapper/interface
 
 	failedInstances  map[string]time.Time // Hostname to first failure time.
@@ -294,7 +291,7 @@ func (c *instanceMaps) addInstance(ref InstanceRef, asg *Asg, instanceID string)
 
 // Categorize all API instances by active/failed for this ASG only.
 // Returns also full list of matching hostnames observed in live API for this ASG.
-// Only VMs this cluster owns (see ownsInstance) are considered.
+// Membership is the hostname prefix only: Verda hostnames are unique per project and immutable.
 func (m *autoScalingGroups) categorizeInstancesForAsg(allInstances []verda.Instance, asg *Asg) (active, failed []verda.Instance, seenHostnames map[string]bool) {
 	matchKey := asg.hostnamePrefix
 	if matchKey == "" {
@@ -307,11 +304,6 @@ func (m *autoScalingGroups) categorizeInstancesForAsg(allInstances []verda.Insta
 		if err != nil || !strings.EqualFold(prefix, matchKey) {
 			continue
 		}
-		if !m.ownsInstance(inst, asg) {
-			klog.V(4).Infof("Skipping instance %s: description %q does not mark it as owned by cluster %q",
-				inst.Hostname, inst.Description, m.cfg.ClusterName)
-			continue
-		}
 		seenHostnames[inst.Hostname] = true
 		if isActiveStatus(inst.Status) {
 			active = append(active, inst)
@@ -320,34 +312,6 @@ func (m *autoScalingGroups) categorizeInstancesForAsg(allInstances []verda.Insta
 		}
 	}
 	return
-}
-
-// ownershipMarker is the VM Description identifying the owning cluster and group.
-func ownershipMarker(clusterName, asgName string) string {
-	return fmt.Sprintf("%s cluster=%s group=%s", ownershipMarkerPrefix, clusterName, asgName)
-}
-
-// parseOwnershipMarker extracts the cluster from a Description written by ownershipMarker.
-func parseOwnershipMarker(description string) (cluster string, ok bool) {
-	fields := strings.Fields(description)
-	if len(fields) == 0 || fields[0] != ownershipMarkerPrefix {
-		return "", false
-	}
-	for _, field := range fields[1:] {
-		if value, found := strings.CutPrefix(field, "cluster="); found {
-			return value, true
-		}
-	}
-	return "", false
-}
-
-// ownsInstance: a marked VM must name this cluster; an unmarked VM is legacy and adopted only when
-// its Description is empty or the group name (what earlier versions wrote).
-func (m *autoScalingGroups) ownsInstance(inst verda.Instance, asg *Asg) bool {
-	if cluster, marked := parseOwnershipMarker(inst.Description); marked {
-		return cluster == m.cfg.ClusterName
-	}
-	return inst.Description == "" || inst.Description == asg.Name
 }
 
 // preservePendingInstances keeps VMs we created within pendingInstanceGracePeriod that the
@@ -738,7 +702,7 @@ func (m *autoScalingGroups) createInstanceForAsg(ctx context.Context, asg *Asg, 
 		SSHKeyIDs:       nodeConfig.SSHKeyIDs,
 		StartupScriptID: &startupScriptID,
 		Hostname:        hostname,
-		Description:     ownershipMarker(m.cfg.ClusterName, asg.Name),
+		Description:     asg.Name,
 		LocationCode:    location,
 		IsSpot:          nodeConfig.IsSpot,
 		Contract:        nodeConfig.Contract,

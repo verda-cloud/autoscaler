@@ -468,3 +468,49 @@ func TestGetInstancesForAsg_StatusAndProviderID(t *testing.T) {
 		t.Errorf("placeholder providerID must match the CCM format; got ids %v", got)
 	}
 }
+
+func TestRegisteredNodeLabels_ClusterLabelOnlyWhenNameSet(t *testing.T) {
+	asg := &Asg{AsgRef: AsgRef{Name: "pool"}, instanceType: "CPU.4V.16G"}
+	for _, tc := range []struct {
+		name, clusterName string
+		wantLabel         bool
+	}{
+		{"name set", "prod-eu", true},
+		{"no name", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			labels := registeredNodeLabels(asg, &nodeConfig{ClusterName: tc.clusterName})
+			got, ok := labels[ClusterLabelKey]
+			if ok != tc.wantLabel || (ok && got != tc.clusterName) {
+				t.Errorf("%s = %q (present=%v), want present=%v value %q", ClusterLabelKey, got, ok, tc.wantLabel, tc.clusterName)
+			}
+			if labels[NodeGroupLabelKey] != "pool" {
+				t.Errorf("%s = %q, want pool", NodeGroupLabelKey, labels[NodeGroupLabelKey])
+			}
+		})
+	}
+}
+
+func TestCreateVerdacloudManager_ClusterNameFallsBackToFlag(t *testing.T) {
+	t.Setenv("VERDA_CLIENT_ID", "REPLACE_ME")
+	t.Setenv("VERDA_CLIENT_SECRET", "REPLACE_ME")
+	script := base64.StdEncoding.EncodeToString([]byte("#!/bin/bash\n"))
+	for _, tc := range []struct{ name, configName, flagName, want string }{
+		{"config wins", `"clusterName": "from-config",`, "from-flag", "from-config"},
+		{"flag fallback", ``, "from-flag", "from-flag"},
+		{"neither", ``, "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfgJSON := `{` + tc.configName + `"image": {"gpu": "g", "cpu": "c"}, "sshKeyIDs": ["k"],
+				"billingConfig": {"price": "FIXED_PRICE", "contract": "PAY_AS_YOU_GO"},
+				"startupScript": "` + script + `", "availableLocations": ["FIN-01"]}`
+			m, err := createVerdacloudManager(strings.NewReader(cfgJSON), cloudprovider.NodeGroupDiscoveryOptions{}, tc.flagName)
+			if err != nil {
+				t.Fatalf("createVerdacloudManager: %v", err)
+			}
+			if m.cfg.ClusterName != tc.want {
+				t.Errorf("ClusterName = %q, want %q", m.cfg.ClusterName, tc.want)
+			}
+		})
+	}
+}

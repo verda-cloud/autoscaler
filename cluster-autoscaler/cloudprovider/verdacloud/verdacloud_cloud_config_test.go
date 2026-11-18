@@ -806,6 +806,7 @@ func intPtr(i int) *int {
 	return &i
 }
 
+// clusterName is optional; when set it must be a valid Kubernetes label value.
 func TestCloudConfig_ValidateClusterName(t *testing.T) {
 	cases := []struct {
 		clusterName string
@@ -813,7 +814,7 @@ func TestCloudConfig_ValidateClusterName(t *testing.T) {
 	}{
 		{"prod-eu", false},
 		{"Prod.EU_1", false},
-		{"", true},
+		{"", false},
 		{"has space", true},
 		{"a=b", true},
 		{"-leading", true},

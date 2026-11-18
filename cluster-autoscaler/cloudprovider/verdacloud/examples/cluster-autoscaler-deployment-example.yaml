@@ -200,8 +200,8 @@ stringData:
 # cloud-controller-manager; the rendered script uses
 # `--cloud-provider=external` and does not need to know its providerID.
 #
-# `clusterName` is required: it is written into each VM's description and
-# the autoscaler never adopts or deletes VMs marked for another cluster.
+# `clusterName` is optional (defaults to --cluster-name) and only labels nodes
+# with verda.com/cluster. Node group membership comes from the VM hostname prefix.
 apiVersion: v1
 kind: ConfigMap
 metadata:
